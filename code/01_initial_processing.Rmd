@@ -1,0 +1,249 @@
+---
+title: "Initial Processing"
+author: "Dariia Artemova"
+output: 
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+    df_print: "paged"
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(Seurat)
+library(Azimuth)
+here::i_am("code/01_initial_processing.Rmd")
+library(here)
+knitr::opts_chunk$set(
+  fig.align = 'center'
+)
+```
+
+## Loading Data
+
+```{r load-counts}
+counts <- read.delim(
+  file = here("data/raw/GBM_raw_gene_counts.csv"), 
+  sep = " ", 
+  row.names = 1, 
+  check.names = F,
+  ) 
+head(counts)[c(1:15, ncol(counts)-5:ncol(counts))]
+```
+
+We loaded `r ncol(counts)` cells and `r nrow(counts)` genes.
+
+```{r load-metadata}
+metadata <- read.delim(
+  file = here("data/raw/GBM_metadata.csv"), 
+  sep = " ", 
+  row.names = 1, 
+  stringsAsFactors = TRUE,
+)
+head(metadata)
+```
+
+```{r tidy-metadata}
+metadata <- metadata |> 
+  select(!c(Sample.type, housekeeping_cluster, ends_with("color"))) |> 
+  rename(Patient = Sample.name, Paper_cluster = Cluster_2d) |> 
+  unite("Batch", Patient, Location, remove = FALSE) |> 
+  relocate(Batch, Patient, Location, Selection) |> 
+  mutate(Batch = as_factor(Batch))
+head(metadata, n = 3)
+```
+
+```{r}
+table(metadata[c("Patient", "Location")])
+```
+
+```{r patient-data}
+patient_data <- read_excel(
+  here("data/raw/patient_data.xlsx"),
+  range = "A2:V6",
+  .name_repair = "unique_quiet"
+  ) |> 
+  rename(Patient = 1) |>
+  rename_with(~ gsub(" ", "_", .x, fixed = TRUE)) |>
+  rename_with(~ paste("Subtype", .x, sep = "_"), Classical:Proneural) |>
+  rename_with(~ paste(.x, "expressing_cell_fraction", sep = "_"), CD274:B2M)
+patient_data
+```
+
+Where WT = Wildtype, M = Methylated, NM = Non methylated, NT = Not tested.
+
+```{r seurat-obj, warning=FALSE}
+options(Seurat.object.assay.calcn = TRUE)
+obj <- CreateSeuratObject(
+  counts = counts,
+  meta.data = metadata,
+  min.cells = 3,
+  min.features = 100,
+  )
+```
+
+We're left with `r length(Cells(obj))` cells and `r length(Features(obj))` genes.
+
+## QC
+
+```{r feature-counts-vis, warning=FALSE}
+VlnPlot(
+  obj,
+  features = c("nFeature_RNA", "nCount_RNA", "ERCC_reads"),
+  layer = "counts",
+) &
+  labs(x = NULL) &
+  scale_x_discrete(labels = NULL, breaks = NULL)
+```
+
+```{r spike-in-vis, warning=FALSE, fig.width=3}
+VlnPlot(
+  obj,
+  features = "ERCC_to_non_ERCC",
+  layer = "counts",
+  y.max = 3,
+) +
+  labs(x = NULL) +
+  scale_x_discrete(labels = NULL, breaks = NULL) +
+  guides(fill="none")
+```
+
+```{r qc-feature-scatter}
+n_feature_cutoff = 200
+n_count_cutoff = 50000
+
+FeatureScatter(
+  obj,
+  feature1 = "nCount_RNA", 
+  feature2 = "nFeature_RNA",
+  cols = "black"
+) +
+  NoLegend() +
+  geom_hline(
+    aes(yintercept = n_feature_cutoff), 
+    color = "red", linetype = "dashed", 
+  ) +
+  geom_vline(
+    aes(xintercept = n_count_cutoff), 
+    color = "red", linetype = "dashed",
+  )
+```
+
+```{r, include=FALSE}
+n_cells_pre <- length(Cells(obj))
+```
+
+```{r qc-subsetting}
+obj <- subset(obj, subset = nFeature_RNA > n_feature_cutoff & nCount_RNA > n_count_cutoff)
+```
+
+`r n_cells_pre - length(Cells(obj))` cells filtered out during QC.
+
+## Cell Type Annotation
+
+```{r azimuth-annotation, include=FALSE}
+options(future.globals.maxSize = 1000 * 1024^2)
+obj <- RunAzimuth(obj, reference = "humancortexref", verbose = F)
+```
+
+```{r gen-vis, fig.width=15, fig.height=10}
+plot_cell_cls <- function(reduction) {
+  (DimPlot(
+  obj, 
+  reduction = reduction,
+  group.by = "predicted.subclass",
+  cols = DiscretePalette(n = length(unique(obj$predicted.subclass)), palette = "polychrome"),
+  pt.size = 0.5,
+) | 
+  FeaturePlot(
+    obj, 
+    reduction = reduction,
+    features = "predicted.subclass.score",
+    pt.size = 0.5,
+  ))  / 
+  (DimPlot(
+    obj, 
+    reduction = reduction,
+    group.by = "Batch",
+    cols = DiscretePalette(n = nlevels(obj$Batch), palette = "polychrome"),
+    pt.size = 0.5,
+  ) |
+  DimPlot(
+      obj, 
+      reduction = reduction,
+      group.by = "Selection",
+      cols = DiscretePalette(n = nlevels(obj$Selection), palette = "polychrome"),
+      pt.size = 0.5,
+  ))
+}
+plot_cell_cls("ref.umap")
+```
+
+## Transformation / DimRed (No Integration Version)
+
+```{r no-intgr-pca}
+obj <- SCTransform(object = obj, verbose = FALSE) |> 
+  RunPCA(verbose = FALSE)
+ElbowPlot(object = obj, ndims = 50)
+```
+
+```{r no-intgr-umap, warning=FALSE, fig.width=15}
+obj <- RunUMAP(object = obj, dims = 1:30, verbose = FALSE)
+
+DimPlot(
+  object = obj, 
+  reduction = "umap",
+  group.by = "Batch",
+  cols = DiscretePalette(n = nlevels(obj$Batch), palette = "polychrome"),
+  pt.size = 0.1,
+) + 
+  DimPlot(
+    object = obj, 
+    reduction = "umap",
+    group.by = "Selection",
+    pt.size = 0.1,
+  )
+```
+
+## Transformation / DimRed (With Integration This Time)
+
+```{r integration, message=FALSE, warning=FALSE}
+obj[["RNA"]] <- split(obj[["RNA"]], f = obj$Batch)
+obj <- SCTransform(object = obj, verbose = FALSE)
+obj <- RunPCA(object = obj, verbose = FALSE)
+ElbowPlot(object = obj, ndims = 50)
+obj <- IntegrateLayers(
+  object = obj,
+  method = HarmonyIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "pca", new.reduction = "harmony",
+  assay = "SCT",
+  verbose = FALSE
+)
+```
+
+```{r integration-umap, message=FALSE, warning=FALSE}
+obj <- RunUMAP(object = obj, reduction = "harmony", dims = 1:30, reduction.name = "umap_harmony", verbose = F)
+```
+
+```{r harmony-vis, fig.width=15, fig.height=10}
+plot_cell_cls("umap_harmony")
+```
+
+## Saving Results
+
+```{r save-rds}
+saveRDS(
+   object = obj,
+   file = here("data/processed/01_initial_processing.Rds")
+)
+```
+
+<details>
+  <summary>Session Info</summary>
+```{r session-info}
+sessionInfo()
+```
+</details>
+
