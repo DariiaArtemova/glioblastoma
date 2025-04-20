@@ -1,0 +1,531 @@
+---
+title: "Initial Processing + Olena"
+output: 
+  html_document:
+    df_print: "paged"
+date: "2025-04-02"
+---
+
+```{r libraries, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(Seurat)
+```
+
+## TODO:
+
+-   properly validate this nonsense
+-   better QC
+-   annotate cell types
+-   find doublets
+-   PaCMAP
+
+## Loading Data
+
+```{r load-counts}
+counts <- read.delim(
+  file = "GBM_raw_gene_counts.csv", 
+  sep = " ", 
+  row.names = 1, 
+  check.names = F,
+  ) 
+head(counts)[c(1:15, ncol(counts)-5:ncol(counts))]
+```
+
+We loaded `r ncol(counts)` cells and `r nrow(counts)` genes.
+
+```{r load-metadata}
+metadata <- read.delim(
+  file = "GBM_metadata.csv", 
+  sep = " ", 
+  row.names = 1, 
+  stringsAsFactors = TRUE,
+)
+head(metadata)
+```
+
+```{r tidy-metadata}
+metadata <- metadata |> 
+  select(!c(Sample.type, housekeeping_cluster, ends_with("color"))) |> 
+  rename(Patient = Sample.name, Paper_cluster = Cluster_2d) |> 
+  unite("Batch", Patient, Location, remove = FALSE) |> 
+  relocate(Batch, Patient, Location, Selection) |> 
+  mutate(Batch = as_factor(Batch))
+head(metadata, n = 3)
+```
+
+```{r}
+table(metadata[c("Patient", "Location")])
+```
+
+```{r patient-data}
+patient_data <- read_excel(
+  "patient_data.xlsx",
+  range = "A2:V6",
+  .name_repair = "unique_quiet"
+  ) |> 
+  rename(Patient = 1) |>
+  rename_with(~ gsub(" ", "_", .x, fixed = TRUE)) |>
+  rename_with(~ paste("Subtype", .x, sep = "_"), Classical:Proneural) |>
+  rename_with(~ paste(.x, "expressing_cell_fraction", sep = "_"), CD274:B2M)
+patient_data
+```
+
+Where WT = Wildtype, M = Methylated, NM = Non methylated, NT = Not tested.
+
+```{r seurat-obj, warning=FALSE}
+obj <- CreateSeuratObject(
+  counts = counts,
+  meta.data = metadata,
+  min.cells = 3,
+  min.features = 100,
+  )
+```
+
+We're left with `r length(Cells(obj))` cells and `r length(Features(obj))` genes.
+
+## QC
+
+```{r feature-counts-vis, warning=FALSE, fig.align='center'}
+VlnPlot(
+  obj,
+  features = c("nFeature_RNA", "nCount_RNA", "ERCC_reads"),
+  layer = "counts",
+) &
+  labs(x = NULL) &
+  scale_x_discrete(labels = NULL, breaks = NULL)
+```
+
+```{r spike-in-vis, warning=FALSE, fig.width=3, fig.align='center'}
+VlnPlot(
+  obj,
+  features = "ERCC_to_non_ERCC",
+  layer = "counts",
+  y.max = 3,
+) +
+  labs(x = NULL) +
+  scale_x_discrete(labels = NULL, breaks = NULL) +
+  guides(fill="none")
+```
+
+```{r qc-feature-scatter, fig.align='center'}
+n_feature_cutoff = 200
+n_count_cutoff = 50000
+
+FeatureScatter(
+  obj,
+  feature1 = "nCount_RNA", 
+  feature2 = "nFeature_RNA",
+  cols = "black"
+) +
+  NoLegend() +
+  geom_hline(
+    aes(yintercept = n_feature_cutoff), 
+    color = "red", linetype = "dashed", 
+  ) +
+  geom_vline(
+    aes(xintercept = n_count_cutoff), 
+    color = "red", linetype = "dashed",
+  )
+```
+```{r, include=FALSE}
+n_cells_pre <- length(Cells(obj))
+```
+
+```{r qc-subsetting}
+obj <- subset(obj, subset = nFeature_RNA > n_feature_cutoff & nCount_RNA > n_count_cutoff)
+```
+
+`r n_cells_pre - length(Cells(obj))` cells filtered out during QC.
+
+## Transformation / DimRed (No Integration Version)
+
+```{r no-intgr-pca}
+obj <- SCTransform(object = obj, verbose = FALSE) |> 
+  RunPCA(verbose = FALSE)
+ElbowPlot(object = obj, ndims = 50)
+```
+
+```{r no-intgr-umap, warning=FALSE, fig.width=15, fig.align='center'}
+obj <- RunUMAP(object = obj, dims = 1:30, verbose = FALSE)
+
+DimPlot(
+  object = obj, 
+  reduction = "umap",
+  group.by = "Batch",
+  cols = DiscretePalette(n = nlevels(obj$Batch), palette = "polychrome"),
+  pt.size = 0.1,
+) + 
+  DimPlot(
+    object = obj, 
+    reduction = "umap",
+    group.by = "Selection",
+    pt.size = 0.1,
+  )
+```
+
+## Transformation / DimRed (With Integration This Time)
+
+```{r integration, fig.align='center'}
+obj[["RNA"]] <- split(obj[["RNA"]], f = obj$Batch)
+obj <- SCTransform(object = obj, verbose = FALSE)
+obj <- RunPCA(object = obj, verbose = FALSE)
+ElbowPlot(object = obj, ndims = 50)
+obj <- IntegrateLayers(
+  object = obj,
+  method = HarmonyIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "pca", new.reduction = "harmony",
+  assay = "SCT",
+  verbose = FALSE
+)
+```
+
+##########################################################################################################################################################
+
+##Harmony_tutorial (M2S05)
+
+```{r echo=TRUE}
+obj <- RunUMAP(obj, reduction = "harmony", assay = "SCT", dims = 1:30, reduction.name = "umap_harmony", verbose = FALSE)
+```
+
+```{r echo=TRUE}
+DimPlot(obj, reduction = "umap_harmony", group.by = "Batch")
+```
+
+```{r echo=TRUE}
+DimPlot(obj, reduction = "umap_harmony", group.by = "Patient")
+```
+
+```{r echo=TRUE}
+DimPlot(obj, reduction = "umap_harmony", group.by = "Location")
+```
+
+## Clustering (M2S11-12)
+
+```{r libraries2, include=FALSE}
+library(clustree)
+library(cluster)
+library(ggplot2)
+library(dplyr)
+library(Seurat)
+```
+
+### Selecting optimal clustering resolution
+
+```{r}
+obj <- FindNeighbors(obj, dims = 1:30, reduction = "harmony")
+Reductions(obj)
+Graphs(obj) 
+```
+
+```{r}
+resolutions <- seq(from = 0.2, to = 2, by = 0.2)
+obj <- FindClusters(obj, resolution = resolutions) 
+```
+
+```{r}
+obj@meta.data
+```
+
+```{r}
+colnames(obj@meta.data)
+```
+
+```{r clustree}
+clustree(obj, prefix = "SCT_snn_res.")
+```
+
+```{r Silhouette score}
+
+harmony_embeddings <- Embeddings(obj, reduction = "harmony")
+dist_matrix <- dist(harmony_embeddings)
+
+sil_scores <- sapply(resolutions, function(res) {
+    col_name <- paste0("SCT_snn_res.", res)
+    cluster_ids <- as.numeric(as.factor(obj@meta.data[[col_name]]))
+    if (length(unique(cluster_ids)) < 2) {
+        return(NA)
+    }
+    sil <- cluster::silhouette(cluster_ids, dist_matrix)
+    if (is.null(dim(sil))) {
+        return(NA)
+    }
+    mean(sil[, "sil_width"])
+})
+
+sil_df <- data.frame(Resolution = resolutions, Avg_Silhouette = sil_scores)
+print(sil_df)
+
+ggplot(sil_df, aes(x = Resolution, y = Avg_Silhouette)) +
+    geom_line() +
+    geom_point() +
+    theme_minimal() +
+    labs(title = "Average Silhouette Score Across Clustering Resolutions",
+         y = "Average Silhouette Width") +
+    scale_x_continuous(breaks = sil_df$Resolution)
+```
+
+```{r}
+obj <- FindClusters(obj, resolution = 0.2)
+```
+
+```{r visualization}
+DimPlot(obj, reduction = "umap_harmony", group.by = "seurat_clusters", label = TRUE, label.box = TRUE, repel = TRUE) + NoLegend()
+```
+
+### Finding markers
+
+```{r}
+FeaturePlot(obj, features = "EGFR") # маркер, активований у багатьох GBM і значно надлишково експресований у неопластичних клітинах.
+FeaturePlot(obj, features = "SOX9") # ТФ з онкогенною роллю в гліомах, також надлишково експресований у неопластичних клітинах.
+FeaturePlot(obj, features = "NFIB") #ТФ, специфічний для новоутворень.
+```
+
+
+```{r, warning=FALSE}
+options(future.globals.maxSize = 750 * 1024^2)
+
+obj <- PrepSCTFindMarkers(object = obj, assay = "SCT", verbose = FALSE)
+```
+
+
+```{r t-test 1:2, warning=FALSE}
+markers_t <- FindMarkers(obj, ident.1 = "1", ident.2 = "2", min.diff.pct = 0.25, test.use = "t")
+
+# Топ маркери більш експресовані в кластері 1
+top_markers_1_t <- markers_t %>% 
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+  arrange(desc(avg_log2FC)) %>% 
+  head(n = 10)
+print("\n10 markers for cluster 1 (t-test 1:2):")
+print(top_markers_1_t, n = 10)
+
+# Топ маркери більш експресовані в кластері 2
+top_markers_2_t <- markers_t %>% 
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+  arrange(avg_log2FC) %>% 
+  head(n = 10)
+print("\n10 markers for cluster 2 (t-test 1:2):")
+print(top_markers_2_t, n = 10)
+```
+
+```{r t-test 0:1, warning=FALSE}
+markers_t <- FindMarkers(obj, ident.1 = "0", ident.2 = "1", min.diff.pct = 0.25, test.use = "t")
+
+# Топ маркери більш експресовані в кластері 0
+top_markers_0_t <- markers_t %>% 
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+  arrange(desc(avg_log2FC)) %>% 
+  head(n = 10)
+print("\n10 markers for cluster 0 (t-test 0:4):")
+print(top_markers_0_t, n = 10)
+
+# Топ маркери більш експресовані в кластері 1
+top_markers_1_t <- markers_t %>% 
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+  arrange(avg_log2FC) %>% 
+  head(n = 10)
+print("\n10 markers for cluster 1 (t-test 0:1):")
+print(top_markers_1_t, n = 10)
+```
+
+```{r t-test 0:4, warning=FALSE}
+markers_t <- FindMarkers(obj, ident.1 = "0", ident.2 = "4", min.diff.pct = 0.25, test.use = "t")
+
+# Топ маркери більш експресовані в кластері 0
+top_markers_0_t <- markers_t %>% 
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+  arrange(desc(avg_log2FC)) %>% 
+  head(n = 10)
+print("\n10 markers for cluster 0 (t-test 0:4):")
+print(top_markers_0_t, n = 10)
+
+# Топ маркери більш експресовані в кластері 4
+top_markers_4_t <- markers_t %>% 
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+  arrange(avg_log2FC) %>% 
+  head(n = 10)
+print("\n10 markers for cluster 4 (t-test 0:4):")
+print(top_markers_4_t, n = 10)
+```
+
+```{r t-test 0:3, warning=FALSE}
+markers_t <- FindMarkers(obj, ident.1 = "0", ident.2 = "3", min.diff.pct = 0.25, test.use = "t")
+
+# Топ маркери більш експресовані в кластері 0
+top_markers_0_t <- markers_t %>% 
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+  arrange(desc(avg_log2FC)) %>% 
+  head(n = 10)
+print("\n10 markers for cluster 0 (t-test 0:3):")
+print(top_markers_0_t, n = 10)
+
+# Топ маркери більш експресовані в кластері 3
+top_markers_3_t <- markers_t %>% 
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+  arrange(avg_log2FC) %>% 
+  head(n = 10)
+print("\n10 markers for cluster 3 (t-test 0:3):")
+print(top_markers_3_t, n = 10)
+```
+
+```{r LR-test 1:2, warning=FALSE}
+markers_lr <- FindMarkers(obj, ident.1 = "1", ident.2 = "2", min.diff.pct = 0.25, test.use = "LR")
+
+# Топ маркери більш експресовані в кластері 1
+top_markers_1_lr <- markers_lr %>% 
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+  arrange(desc(avg_log2FC)) %>% 
+  head(n = 10)
+print("\n10 markers for cluster 1 (LR-test 1:2):")
+print(top_markers_1_lr)
+
+# Топ маркери більш експресовані в кластері 2
+top_markers_2_lr <- markers_lr %>% 
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+  arrange(avg_log2FC) %>% 
+  head(n = 10)
+print("\n10 markers for cluster 2 (LR-test 1:2):")
+print(top_markers_2_lr)
+```
+
+
+```{r LR-test 0:1, warning=FALSE}
+markers_lr <- FindMarkers(obj, ident.1 = "0", ident.2 = "1", min.diff.pct = 0.25, test.use = "LR")
+
+# Топ маркери більш експресовані в кластері 0
+top_markers_0_lr <- markers_lr %>% 
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+  arrange(desc(avg_log2FC)) %>% 
+  head(n = 10)
+print("\n10 markers for cluster 0 (LR-test 0:1):")
+print(top_markers_0_lr)
+
+# Топ маркери більш експресовані в кластері 1
+top_markers_1_lr <- markers_lr %>% 
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+  arrange(avg_log2FC) %>% 
+  head(n = 10)
+print("\n10 markers for cluster 1 (LR-test 0:1):")
+print(top_markers_1_lr)
+```
+
+```{r LR-test 0:3, warning=FALSE}
+markers_lr <- FindMarkers(obj, ident.1 = "0", ident.2 = "3", min.diff.pct = 0.25, test.use = "LR")
+
+# Топ маркери більш експресовані в кластері 0
+top_markers_0_lr <- markers_lr %>% 
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+  arrange(desc(avg_log2FC)) %>% 
+  head(n = 10)
+print("\n10 markers for cluster 0 (LR-test 0:3):")
+print(top_markers_0_lr)
+
+# Топ маркери більш експресовані в кластері 3
+top_markers_1_lr <- markers_lr %>% 
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+  arrange(avg_log2FC) %>% 
+  head(n = 10)
+print("\n10 markers for cluster 3 (LR-test 0:3):")
+print(top_markers_1_lr)
+```
+
+```{r LR-test 0:4, warning=FALSE}
+markers_lr <- FindMarkers(obj, ident.1 = "0", ident.2 = "4", min.diff.pct = 0.25, test.use = "LR")
+
+# Топ маркери більш експресовані в кластері 0
+top_markers_0_lr <- markers_lr %>% 
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+  arrange(desc(avg_log2FC)) %>% 
+  head(n = 10)
+print("\n10 markers for cluster 0 (LR-test 0:4):")
+print(top_markers_0_lr)
+
+# Топ маркери більш експресовані в кластері 4
+top_markers_4_lr <- markers_lr %>% 
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% 
+  arrange(avg_log2FC) %>% 
+  head(n = 10)
+print("\n10 markers for cluster 4 (LR-test 0:4):")
+print(top_markers_4_lr)
+```
+
+
+## FeaturePlot(): Відображення рівня експресії гена на UMAP або іншому редукційному графіку. Це дозволяє побачити, чи експресія гена специфічна для певних кластерів.
+
+```{r}
+DefaultAssay(obj) <- 'RNA'
+obj <- NormalizeData(obj, verbose = FALSE)
+cluster_0_genes <- c("GGTA1P", "IL8", "THBS1", "GPR183")
+cluster_1_genes <- c("PCDH17", "STMN4", "PPP1R9A", "LPPR1")
+
+plots_cluster_0 <- FeaturePlot(obj,
+                                 features = cluster_0_genes,
+                                 reduction = "umap_harmony",
+                                 slot = "data")
+print(plots_cluster_0)
+
+plots_cluster_1 <- FeaturePlot(obj,
+                                 features = cluster_1_genes,
+                                 reduction = "umap_harmony",
+                                 slot = "data")
+print(plots_cluster_1)
+```
+
+```{r}
+DefaultAssay(obj) <- 'RNA'
+obj <- NormalizeData(obj, verbose = FALSE)
+Classical <- c("EGFR", "STAT3", "CD44") 
+Mesenchymal <- c("CD44", "YKL-40", "MERTK", "VEGF") 
+Neural <- c("NEFL", "GABRA1", "SYT1")
+Proneural <- c("PDGFRA", "OLIG2", "NG2", "IDH1")
+
+FeaturePlot(obj,
+            features = c(Classical),
+            reduction = "umap_harmony",
+            slot = "data",
+            ncol = 4)
+FeaturePlot(obj,
+            features = c(Mesenchymal),
+            reduction = "umap_harmony",
+            slot = "data",
+            ncol = 4)
+FeaturePlot(obj,
+            features = c(Neural),
+            reduction = "umap_harmony",
+            slot = "data",
+            ncol = 4)
+FeaturePlot(obj,
+            features = c(Proneural),
+            reduction = "umap_harmony",
+            slot = "data",
+            ncol = 4)
+```
+
+```{r}
+DefaultAssay(obj) <- 'RNA'
+obj <- NormalizeData(obj, verbose = FALSE)
+Invasive <- c("ENPP2", "EFNB3", "BCLW", "PTK2B")
+Tumor_core <- c("IGFBP2", "VIM", "CD44", "VEGF")
+FeaturePlot(obj,
+            features = c(Invasive),
+            reduction = "umap_harmony",
+            slot = "data",
+            ncol = 4)
+FeaturePlot(obj,
+            features = c(Tumor_core),
+            reduction = "umap_harmony",
+            slot = "data",
+            ncol = 4)
+```
+
+## VlnPlot(): Відображення розподілу експресії гена в різних кластерах. Це допомагає оцінити специфічність та варіабельність експресії.
+
+```{r}
+DefaultAssay(obj) <- 'RNA'
+VlnPlot(obj, features = cluster_0_genes, group.by = 'seurat_clusters')
+VlnPlot(obj, features = cluster_1_genes, group.by = 'seurat_clusters')
+```
+
+
