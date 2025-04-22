@@ -1,0 +1,69 @@
+---
+title: "Analysis of Microglia and Monocyte Derived Macrophages"
+author: "Dariia Artemova"
+output: 
+  html_document:
+    df_print: "paged"
+---
+
+```{r setup, include=FALSE}
+library(Seurat)
+here::i_am("code/02_analysis_dartemova_macrophages.Rmd")
+library(here)
+knitr::opts_chunk$set(
+  fig.align = 'center'
+)
+```
+
+```{r read-data}
+obj <- readRDS(file = here("data/processed/01_initial_processing.Rds"))
+```
+
+```{r type-scoring}
+macrophages <- subset(x = obj, subset = predicted.subclass == "Micro-PVM" & predicted.subclass.score > 0.9)
+
+microglia <- c("BIN1", "C1QC", "CX3CR1", "NAV3", "P2RY12", "SALL1", "SIGLEC8", "SLC1A3", "HEXB", "TMEM119", "SCIN")
+mdm <- c("ITGA4", "PTPRC", "CCR2", "TGFBI", "CLEC12A", "FXYD5", "THBD", "CD1C", "FCGR2B", "CLEC10A", "CD209")
+
+macrophages <- AddModuleScore(
+  macrophages,
+  features = list(microglia, mdm),
+  name = "type_score",
+  search = T,
+) 
+macrophages$microglia_score <- macrophages$type_score1
+macrophages$mdm_score <- macrophages$type_score2
+macrophages$type_score1 <- NULL
+macrophages$type_score2 <- NULL
+```
+
+```{r dimplots, warning=FALSE, fig.width=15, fig.height=7}
+FeaturePlot(
+  macrophages,
+  features = c("microglia_score"),
+  reduction = "umap_harmony",
+  pt.size = 0.6
+) |
+  FeaturePlot(
+  macrophages,
+  features = c("mdm_score"),
+  reduction = "umap_harmony",
+  pt.size = 0.6
+) |
+DimPlot( 
+  macrophages, 
+  reduction = "umap_harmony",
+  group.by = "Location",
+  pt.size = 0.6
+)
+```
+
+```{r feat-scatter, fig.width=15, fig.height=7}
+FeatureScatter(
+  macrophages,
+  "microglia_score",
+  "mdm_score",
+  group.by = "Location",
+  pt.size = 2,
+) 
+```
