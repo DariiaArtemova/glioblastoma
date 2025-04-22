@@ -1,0 +1,1199 @@
+---
+title: "Initial Processing_Iryna_Zhuk"
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+  pdf_document: default
+date: "2025-04-21"
+
+
+```{r libraries, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(Seurat)
+```
+
+## TODO:
+
+-   properly validate this nonsense
+-   better QC
+-   annotate cell types
+-   find doublets
+-   PaCMAP
+
+## Loading Data
+
+```{r load-counts}
+counts <- read.delim(
+  file = "GBM_raw_gene_counts.csv", 
+  sep = " ", 
+  row.names = 1, 
+  check.names = F,
+  ) 
+head(counts)[c(1:15, ncol(counts)-5:ncol(counts))]
+```
+
+We loaded `r ncol(counts)` cells and `r nrow(counts)` genes.
+##I had an issue with file GBM_metadata.csv. There was an error about Sample.type, something like "Sample.type does not exist". I supposed that something was wrong with separation. I checked file manually for " ", and one time code worked. Next time the same error appeared again. so I tried to use txt format instead of csv. Now it works just fine. The file convertation is made before the code in R starts and other team members may use csv.
+
+```{r load-metadata}
+metadata <- read.delim(
+  file = "GBM_metadata.txt", 
+  sep = " ", 
+  row.names = 1, 
+  stringsAsFactors = TRUE,
+)
+head(metadata)
+all(colnames(counts) %in% rownames(metadata))
+
+
+
+
+metadata <- metadata |> 
+  select(!c(Sample.type, housekeeping_cluster, ends_with("color"))) |> 
+  rename(Patient = Sample.name, Paper_cluster = Cluster_2d) |> 
+  unite("Batch", Patient, Location, remove = FALSE) |> 
+  relocate(Batch, Patient, Location, Selection) |> 
+  mutate(Batch = as_factor(Batch))
+head(metadata, n = 3)
+```
+
+```{r}
+table(metadata[c("Patient", "Location")])
+```
+
+```{r patient-data}
+patient_data <- read_excel(
+  "patient_data.xlsx",
+  range = "A2:V6",
+  .name_repair = "unique_quiet"
+  ) |> 
+  rename(Patient = 1) |>
+  rename_with(~ gsub(" ", "_", .x, fixed = TRUE)) |>
+  rename_with(~ paste("Subtype", .x, sep = "_"), Classical:Proneural) |>
+  rename_with(~ paste(.x, "expressing_cell_fraction", sep = "_"), CD274:B2M)
+patient_data
+```
+
+Where WT = Wildtype, M = Methylated, NM = Non methylated, NT = Not tested.
+
+```{r seurat-obj, warning=FALSE}
+obj <- CreateSeuratObject(
+  counts = counts,
+  meta.data = metadata,
+  min.cells = 3,
+  min.features = 100,
+  )
+```
+
+We're left with `r length(Cells(obj))` cells and `r length(Features(obj))` genes.
+
+## QC
+
+```{r feature-counts-vis, fig.align='center', warning=FALSE}
+VlnPlot(
+  obj,
+  features = c("nFeature_RNA", "nCount_RNA", "ERCC_reads"),
+  layer = "counts",
+) &
+  labs(x = NULL) &
+  scale_x_discrete(labels = NULL, breaks = NULL)
+```
+
+```{r spike-in-vis, warning=FALSE, fig.width=3, fig.align='center'}
+VlnPlot(
+  obj,
+  features = "ERCC_to_non_ERCC",
+  layer = "counts",
+  y.max = 3,
+) +
+  labs(x = NULL) +
+  scale_x_discrete(labels = NULL, breaks = NULL) +
+  guides(fill="none")
+```
+
+```{r qc-feature-scatter, fig.align='center'}
+n_feature_cutoff = 200
+n_count_cutoff = 50000
+
+FeatureScatter(
+  obj,
+  feature1 = "nCount_RNA", 
+  feature2 = "nFeature_RNA",
+  cols = "black"
+) +
+  NoLegend() +
+  geom_hline(
+    aes(yintercept = n_feature_cutoff), 
+    color = "red", linetype = "dashed", 
+  ) +
+  geom_vline(
+    aes(xintercept = n_count_cutoff), 
+    color = "red", linetype = "dashed",
+  )
+```
+```{r, include=FALSE}
+n_cells_pre <- length(Cells(obj))
+```
+
+```{r qc-subsetting}
+obj <- subset(obj, subset = nFeature_RNA > n_feature_cutoff & nCount_RNA > n_count_cutoff)
+```
+
+`r n_cells_pre - length(Cells(obj))` cells filtered out during QC.
+
+## Transformation / DimRed (No Integration Version)
+
+```{r no-intgr-pca}
+obj <- SCTransform(object = obj, verbose = FALSE) |> 
+  RunPCA(verbose = FALSE)
+ElbowPlot(object = obj, ndims = 50)
+```
+
+```{r no-intgr-umap, warning=FALSE, fig.width=15, fig.align='center'}
+obj <- RunUMAP(object = obj, dims = 1:30, verbose = FALSE)
+
+DimPlot(
+  object = obj, 
+  reduction = "umap",
+  group.by = "Batch",
+  cols = DiscretePalette(n = nlevels(obj$Batch), palette = "polychrome"),
+  pt.size = 0.1,
+) + 
+  DimPlot(
+    object = obj, 
+    reduction = "umap",
+    group.by = "Selection",
+    pt.size = 0.1,
+  )
+
+## Transformation / DimRed (With Integration This Time)
+{r}
+{r integration, message=FALSE, warning=FALSE, fig.align='center'}
+# If you're trying to split by batch, do it on the full object, not RNA assay
+# But this line is likely not needed:
+# obj[["RNA"]] <- split(obj[["RNA"]], f = obj$Batch)
+```
+``
+```{r}
+```{r harmony-integration, message=FALSE, warning=FALSE, fig.align='center'}
+# Check that Batch info exists and has 2+ levels
+if (!"Batch" %in% colnames(obj@meta.data)) {
+  stop("No 'Batch' column found in metadata. Please add batch information to obj$Batch.")
+}
+
+# Print batch distribution
+print(table(obj$Batch))
+
+# Make sure Batch is a factor
+obj$Batch <- as.factor(obj$Batch)
+
+if (length(levels(obj$Batch)) < 2) {
+  warning("Only one batch detected. Skipping Harmony integration.")
+} else {
+  # Normalize using SCTransform
+  obj <- SCTransform(obj, verbose = FALSE)
+
+  # PCA
+  obj <- RunPCA(obj, verbose = FALSE)
+
+  # Elbow plot to help choose PCs
+  ElbowPlot(obj, ndims = 50)
+
+  # Run Harmony integration
+  obj <- IntegrateLayers(
+    object = obj,
+    method = HarmonyIntegration,
+    normalization.method = "SCT",
+    orig.reduction = "pca",
+    new.reduction = "harmony",
+    assay = "SCT",
+    verbose = FALSE
+  )
+}
+```
+
+
+```{r integration, message=FALSE, warning=FALSE, fig.align='center'}
+# Normalize using SCTransform
+obj <- SCTransform(obj, verbose = FALSE)
+
+# Run PCA
+obj <- RunPCA(obj, verbose = FALSE)
+
+# Elbow plot to choose PCs
+ElbowPlot(obj, ndims = 50)
+
+# Harmony integration (uses Batch info in obj$Batch)
+obj <- IntegrateLayers(
+  object = obj,
+  method = HarmonyIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "pca",
+  new.reduction = "harmony",
+  assay = "SCT",
+  verbose = FALSE
+)
+```
+```{r}
+# SCTransform normalization
+obj <- SCTransform(object = obj, verbose = FALSE)
+
+# PCA
+obj <- RunPCA(object = obj, verbose = FALSE)
+
+# Elbow plot
+ElbowPlot(object = obj, ndims = 50)
+
+# Harmony integration
+obj <- IntegrateLayers(
+  object = obj,
+  method = HarmonyIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "pca",
+  new.reduction = "harmony",
+  assay = "SCT",
+  verbose = FALSE
+)
+```
+```
+```
+
+
+```{r}
+```{r no-intgr-umap, warning=FALSE, fig.width=15, fig.align='center'}
+`{r integration, message=FALSE, warning=FALSE, fig.align='center'}
+obj[["RNA"]] <- split(obj[["RNA"]], f = obj$Batch)
+obj <- SCTransform(object = obj, verbose = FALSE)
+obj <- RunPCA(object = obj, verbose = FALSE)
+ElbowPlot(object = obj, ndims = 50)
+obj <- IntegrateLayers(
+  object = obj,
+  method = HarmonyIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "pca", new.reduction = "harmony",
+  assay = "SCT",
+  verbose = FALSE
+)
+```
+
+```{r integration-umap, message=FALSE, warning=FALSE, fig.width=15, fig.align='center'}
+obj <- RunUMAP(object = obj, reduction = "harmony", dims = 1:30, reduction.name = "umap_harmony", verbose = F)
+
+DimPlot(
+  object = obj, 
+  reduction = "umap_harmony",
+  group.by = "Batch",
+  cols = DiscretePalette(n = nlevels(obj$Batch), palette = "polychrome"),
+  pt.size = 0.1,
+) + 
+  DimPlot(
+    object = obj, 
+    reduction = "umap_harmony",
+    group.by = "Selection",
+    pt.size = 0.1,
+  )
+```
+#there is code for few hypoxia genes from literature. I replaced that later because I found that I can use not only several genes but sets.
+```{r}
+``# Optional: install TinyTeX if you're knitting to PDF
+tinytex::install_tinytex()
+
+# Define hypoxia-related genes (cleaned)
+hypoxia_genes <- c(
+  "VEGFA", "CA9", "SLC2A1", "LDHA", "HIF1A", "EGLN1", 
+  "ANGPTL4", "ADM", "EPO", "CXCR4", "BNIP3", "MMP2"
+)
+
+# Subset the counts matrix for these genes
+hypoxia_data <- counts[rownames(counts) %in% hypoxia_genes, ]
+
+# Install pheatmap if not available
+if (!requireNamespace("pheatmap", quietly = TRUE)) {
+  install.packages("pheatmap")
+}
+
+# Optional: check which of these genes are actually present
+present_genes <- hypoxia_genes[hypoxia_genes %in% rownames(counts)]
+
+# Extract hypoxia gene expression from the count matrix
+hypoxia_data <- counts[present_genes, ]
+
+# Transpose for heatmap or sample-wise analysis
+hypoxia_data_t <- as.data.frame(t(hypoxia_data))
+```
+
+```{r}
+seurat_obj <- AddModuleScore(seurat_obj, features = list(hypoxia_genes), name = "HypoxiaScore")
+
+```{r}
+library(Seurat)
+library(ggplot2)
+# Step 1: Define hypoxia-related genes (example from Buffa Hypoxia Metagene)
+ hypoxia_genes <- c("SLC2A1", "VEGFA", "LDHA", "ENO1", "PGK1", "P4HA1", "ADM", "NDRG1", "BNIP3", "PDK1")  # customize this list
+```
+
+
+```{r}
+# Step 2: Calculate hypoxia score
+seurat_obj <- AddModuleScore(
++     object = seurat_obj,
++     features = list(hypoxia_genes),
++     name = "HypoxiaScore"
++ )
+ # Step 3a: Visualize Hypoxia Score on UMAP
+ DimPlot(seurat_obj, reduction = "umap", group.by = "seurat_clusters") +
++     ggtitle("UMAP by Seurat Clusters")
+ 
+FeaturePlot(seurat_obj, features = "HypoxiaScore1", cols = c("lightgrey", "red")) +
++     ggtitle("Hypoxia Score on UMAP")
+ 
+> # Step 3b: Violin plot of Hypoxia Score across clusters
+> VlnPlot(seurat_obj, features = "HypoxiaScore1", group.by = "seurat_clusters") +
++     ggtitle("Hypoxia Score by Cluster")
+> # Load necessary libraries
+> library(Seurat)
+> library(ggplot2)
+
+# Step 1: Define the KRIEG_HYPOXIA_VIA_KDM3A gene set # Replace the following vector with the actual gene symbols from the downloaded gene set
+ krieg_genes <- c("ADM", "GDF15", "VEGFA", "BNIP3", "P4HA1", "NDRG1", "SLC2A1", "CA9", "ENO1", "LDHA")  # Example genes
+> 
+> # Step 2: Calculate hypoxia score
+> seurat_obj <- AddModuleScore(
++     object = seurat_obj,
++     features = list(krieg_genes),
++     name = "Hypoxia_KDM3A"
++ )
+ 
+ # Step 3a: Visualize Hypoxia Score on UMAP
+> FeaturePlot(seurat_obj, features = "Hypoxia_KDM3A1", cols = c("lightgrey", "red")) +
++     ggtitle("Hypoxia Score (KDM3A) on UMAP")
+> 
+> # Step 3b: Violin plot of Hypoxia Score across clusters
+> VlnPlot(seurat_obj, features = "Hypoxia_KDM3A1", group.by = "seurat_clusters") +
++     ggtitle("Hypoxia Score (KDM3A) by Cluster")
+> 
+> # Step 1: Define the BUFFA_HYPOXIA_METAGENE gene set
+> # Replace the following vector with the actual gene symbols from the BUFFA_HYPOXIA_METAGENE gene set
+> buffa_genes <- c("SLC2A1", "VEGFA", "LDHA", "ENO1", "PGK1", "P4HA1", "ADM", "NDRG1", "BNIP3", "PDK1")  # Example genes
+> 
+> # Step 2: Calculate hypoxia score
+> seurat_obj <- AddModuleScore(
++     object = seurat_obj,
++     features = list(buffa_genes),
++     name = "Hypoxia_Buffa"
++ )
+> 
+> # Step 3a: Visualize Hypoxia Score on UMAP
+> FeaturePlot(seurat_obj, features = "Hypoxia_Buffa1", cols = c("lightgrey", "red")) +
++     ggtitle("Hypoxia Score (Buffa) on UMAP")
+> 
+> # Step 3b: Violin plot of Hypoxia Score across clusters
+> VlnPlot(seurat_obj, features = "Hypoxia_Buffa1", group.by = "seurat_clusters") +
++     ggtitle("Hypoxia Score (Buffa) by Cluster")
+> # Load required libraries
+> library(Seurat)
+> library(ggplot2)
+> 
+> # Step 1: Define the SEMENZA_HIF1_TARGETS gene set
+> # This list is based on the MSigDB entry for SEMENZA_HIF1_TARGETS
+> semenza_genes <- c(
++     "ADM", "ALDOA", "CA9", "ENO1", "ENO2", "GPI", "HK1", "HK2", "LDHA", "PGAM1", "PGK1",
++     "PFKP", "SLC2A1", "TPI1", "VEGFA", "PDK1", "BNIP3", "GAPDH", "HMOX1", "IGFBP3",
++     "NOS2", "SLC2A3", "SPP1", "TFR2", "TFRC", "TUBB", "TUBB3", "HIF1A"
++ )
+> 
+> # Step 2: Calculate hypoxia score in the Seurat object
+> seurat_obj <- AddModuleScore(
++     object = seurat_obj,
++     features = list(semenza_genes),
++     name = "Hypoxia_Semenza"
++ )
+> 
+ # Step 3a: Visualize Hypoxia Score on UMAP
+ FeaturePlot(seurat_obj, features = "Hypoxia_Semenza1", cols = c("lightgrey", "blue")) +
+    ggtitle("Hypoxia Score (Semenza HIF1 Targets) on UMAP")
+ # Step 3b: Violin plot of Hypoxia Score across clusters
+ VlnPlot(seurat_obj, features = "Hypoxia_Semenza1", group.by = "seurat_clusters") +
+     ggtitle("Hypoxia Score (Semenza HIF1 Targets) by Cluster")
+ # Extract hypoxia scores from Seurat object metadata
+ scores_df <- seurat_obj@meta.data[, c("Hypoxia_Buffa1", "Hypoxia_Krieg1", "Hypoxia_Semenza1")]
+
+ colnames(seurat_obj@meta.data)
+ [1] "orig.ident"       "nCount_RNA"       "nFeature_RNA"     "HypoxiaScore1"   
+ [5] "RNA_snn_res.0.5"  "seurat_clusters"  "group"            "Hypoxia_KDM3A1"  
+ [9] "Hypoxia_Buffa1"   "Hypoxia_Semenza1"
+library(GGally)
+install.packages("GGally")
+library(GGally)
+avg_by_sample <- aggregate(
+ seurat_obj@meta.data[, c("Hypoxia_Buffa1", "Hypoxia_KDM3A1", "Hypoxia_Semenza1")],
+ by = list(Sample = seurat_obj$orig.ident),
+ FUN = mean
+)
+
+library(tidyr)
+avg_sample_long <- avg_by_sample %>%
+pivot_longer(cols = -Sample, names_to = "GeneSet", values_to = "AvgScore")
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+ # Compute average hypoxia scores per sample
+avg_by_sample <- seurat_obj@meta.data %>%
+group_by(Sample = orig.ident) %>%
+summarise(Buffa = mean(Hypoxia_Buffa1, na.rm = TRUE),
+          Krieg = mean(Hypoxia_KDM3A1, na.rm = TRUE),
+          Semenza = mean(Hypoxia_Semenza1, na.rm = TRUE)
+)
+ 
+ # Pivot longer for plotting
+ avg_sample_long <- avg_by_sample %>%
+ pivot_longer(cols = c(Buffa, Krieg, Semenza), names_to = "GeneSet", values_to = "AvgScore")
+ 
+ # Plot
+ggplot(avg_sample_long, aes(x = Sample, y = AvgScore, fill = GeneSet))
+geom_col(position = "dodge") +
+theme_minimal() +
+labs(title = "Average Hypoxia Score per Sample", y = "Average Score", x = "Sample") +
+scale_fill_brewer(palette = "Set3")
+avg_by_cluster <- seurat_obj@meta.data %>%
+group_by(Cluster = as.character(seurat_clusters)) %>%
+summarise( Buffa = mean(Hypoxia_Buffa1, na.rm = TRUE),
++         Krieg = mean(Hypoxia_KDM3A1, na.rm = TRUE),
++         Semenza = mean(Hypoxia_Semenza1, na.rm = TRUE)
++     )
+
+ avg_cluster_long <- avg_by_cluster %>%
+ pivot_longer(cols = c(Buffa, Krieg, Semenza), names_to = "GeneSet", values_to = "AvgScore")
+
+ ggplot(avg_cluster_long, aes(x = Cluster, y = AvgScore, fill = GeneSet)) +
++     geom_col(position = "dodge") +
++     theme_minimal() +
++     labs(title = "Average Hypoxia Score per Cluster", y = "Average Score", x = "Cluster") +
++     scale_fill_brewer(palette = "Pastel2")
+install.packages("viridis")  # If not installed
+library(viridis)
+ggplot(avg_sample_long, aes(x = Sample, y = AvgScore, fill = GeneSet)) +
+geom_col(position = "dodge") +
+theme_minimal(base_size = 14) +
+scale_fill_viridis(discrete = TRUE, option = "D") +  # High-contrast, colorblind-friendly
+labs(title = "Average Hypoxia Score per Sample",
+y = "Average Score", x = "Sample") +
+theme(legend.position = "right")
+> ggplot(avg_cluster_long, aes(x = Cluster, y = AvgScore, fill = GeneSet)) +
++     geom_col(position = "dodge") +
++     theme_minimal(base_size = 14) +
++     scale_fill_viridis(discrete = TRUE, option = "D") +
++     labs(
++         title = "Average Hypoxia Score per Cluster",
++         y = "Average Score", x = "Cluster"
++     ) +
++     theme(legend.position = "right")
+```{r}
+seurat_obj <- AddModuleScore(seurat_obj, features = list(hypoxia_genes), name = "HypoxiaScore")
+library(Seurat)
+library(ggplot2)
+
+ # Step 1: Define hypoxia-related genes (example from Buffa Hypoxia Metagene)
+hypoxia_genes <- c("SLC2A1", "VEGFA", "LDHA", "ENO1", "PGK1", "P4HA1", "ADM", "NDRG1", "BNIP3", "PDK1")  # customize this list
+  > 
+# Step 2: Calculate hypoxia score
+seurat_obj <- AddModuleScore(
+object = seurat_obj,
+features = list(hypoxia_genes),
+name = "HypoxiaScore"
+      + )
+    > 
+      > # Step 3a: Visualize Hypoxia Score on UMAP
+      > DimPlot(seurat_obj, reduction = "umap", group.by = "seurat_clusters") +
+      +     ggtitle("UMAP by Seurat Clusters")
+    > 
+      > FeaturePlot(seurat_obj, features = "HypoxiaScore1", cols = c("lightgrey", "red")) +
+      +     ggtitle("Hypoxia Score on UMAP")
+    > 
+      > # Step 3b: Violin plot of Hypoxia Score across clusters
+      > VlnPlot(seurat_obj, features = "HypoxiaScore1", group.by = "seurat_clusters") +
+      +     ggtitle("Hypoxia Score by Cluster")
+      
+`{r libraries, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(Seurat)
+library(tidyverse)
+library(readxl)
+library(Seurat)
+counts <- read.delim(
+file = "GBM_raw_gene_counts.csv",
+sep = " ",
+row.names = 1,
+check.names = F,
+)
+head(counts)[c(1:15, ncol(counts)-5:ncol(counts))]
+metadata <- read.delim(
+file = "GBM_metadata.txt",
+sep = " ",
+row.names = 1,
+stringsAsFactors = TRUE,
+)
+head(metadata)
+all(colnames(counts) %in% rownames(metadata))
+metadata <- metadata |>
+select(!c(Sample.type, housekeeping_cluster, ends_with("color"))) |>
+rename(Patient = Sample.name, Paper_cluster = Cluster_2d) |>
+unite("Batch", Patient, Location, remove = FALSE) |>
+relocate(Batch, Patient, Location, Selection) |>
+mutate(Batch = as_factor(Batch))
+head(metadata, n = 3)
+table(metadata[c("Patient", "Location")])
+patient_data <- read_excel(
+"patient_data.xlsx",
+range = "A2:V6",
+.name_repair = "unique_quiet"
+) |>
+rename(Patient = 1) |>
+rename_with(~ gsub(" ", "_", .x, fixed = TRUE)) |>
+rename_with(~ paste("Subtype", .x, sep = "_"), Classical:Proneural) |>
+rename_with(~ paste(.x, "expressing_cell_fraction", sep = "_"), CD274:B2M)
+patient_data
+obj <- CreateSeuratObject(
+counts = counts,
+meta.data = metadata,
+min.cells = 3,
+min.features = 100,
+)
+VlnPlot(
+obj,
+features = c("nFeature_RNA", "nCount_RNA", "ERCC_reads"),
+layer = "counts",
+) &
+labs(x = NULL) &
+scale_x_discrete(labels = NULL, breaks = NULL)
+n_feature_cutoff = 200
+n_count_cutoff = 50000
+FeatureScatter(
+obj,
+feature1 = "nCount_RNA",
+feature2 = "nFeature_RNA",
+cols = "black"
+) +
+NoLegend() +
+geom_hline(
+aes(yintercept = n_feature_cutoff),
+color = "red", linetype = "dashed",
+) +
+geom_vline(
+aes(xintercept = n_count_cutoff),
+color = "red", linetype = "dashed",
+)
+obj <- SCTransform(object = obj, verbose = FALSE) |>
+RunPCA(verbose = FALSE)
+ElbowPlot(object = obj, ndims = 50)
+obj <- RunUMAP(object = obj, dims = 1:30, verbose = FALSE)
+load("D:/Iren_Zhuk_documentsHP/Documents/Rdataprojectfiles/.RData")
+obj <- RunUMAP(object = obj, dims = 1:30, verbose = FALSE)
+seurat_obj <- AddModuleScore(seurat_obj, features = list(hypoxia_genes), name = "HypoxiaScore")
+library(Seurat)
+library(ggplot2)
+# Step 1: Define hypoxia-related genes (example from Buffa Hypoxia Metagene)
+hypoxia_genes <- c("SLC2A1", "VEGFA", "LDHA", "ENO1", "PGK1", "P4HA1", "ADM", "NDRG1", "BNIP3", "PDK1")  # customize this list
+# Step 2: Calculate hypoxia score
+seurat_obj <- AddModuleScore(
+object = seurat_obj,
+features = list(hypoxia_genes),
+name = "HypoxiaScore"
+)
+# Step 3a: Visualize Hypoxia Score on UMAP
+DimPlot(seurat_obj, reduction = "umap", group.by = "seurat_clusters") +
+ggtitle("UMAP by Seurat Clusters")
+FeaturePlot(seurat_obj, features = "HypoxiaScore1", cols = c("lightgrey", "red")) +
+ggtitle("Hypoxia Score on UMAP")
+# Step 3b: Violin plot of Hypoxia Score across clusters
+VlnPlot(seurat_obj, features = "HypoxiaScore1", group.by = "seurat_clusters") +
+ggtitle("Hypoxia Score by Cluster")
+# Load necessary libraries
+library(Seurat)
+library(ggplot2)
+# Step 1: Define the KRIEG_HYPOXIA_VIA_KDM3A gene set
+# Replace the following vector with the actual gene symbols from the downloaded gene set
+krieg_genes <- c("ADM", "GDF15", "VEGFA", "BNIP3", "P4HA1", "NDRG1", "SLC2A1", "CA9", "ENO1", "LDHA")  # Example genes
+# Step 2: Calculate hypoxia score
+seurat_obj <- AddModuleScore(
+object = seurat_obj,
+features = list(krieg_genes),
+name = "Hypoxia_KDM3A"
+)
+# Step 3a: Visualize Hypoxia Score on UMAP
+FeaturePlot(seurat_obj, features = "Hypoxia_KDM3A1", cols = c("lightgrey", "red")) +
+ggtitle("Hypoxia Score (KDM3A) on UMAP")
+# Step 3b: Violin plot of Hypoxia Score across clusters
+VlnPlot(seurat_obj, features = "Hypoxia_KDM3A1", group.by = "seurat_clusters") +
+ggtitle("Hypoxia Score (KDM3A) by Cluster")
+# Step 1: Define the BUFFA_HYPOXIA_METAGENE gene set
+# Replace the following vector with the actual gene symbols from the BUFFA_HYPOXIA_METAGENE gene set
+buffa_genes <- c("SLC2A1", "VEGFA", "LDHA", "ENO1", "PGK1", "P4HA1", "ADM", "NDRG1", "BNIP3", "PDK1")  # Example genes
+# Step 2: Calculate hypoxia score
+seurat_obj <- AddModuleScore(
+object = seurat_obj,
+features = list(buffa_genes),
+name = "Hypoxia_Buffa"
+)
+# Step 3a: Visualize Hypoxia Score on UMAP
+FeaturePlot(seurat_obj, features = "Hypoxia_Buffa1", cols = c("lightgrey", "red")) +
+ggtitle("Hypoxia Score (Buffa) on UMAP")
+# Step 3b: Violin plot of Hypoxia Score across clusters
+VlnPlot(seurat_obj, features = "Hypoxia_Buffa1", group.by = "seurat_clusters") +
+ggtitle("Hypoxia Score (Buffa) by Cluster")
+# Load required libraries
+library(Seurat)
+library(ggplot2)
+# Step 1: Define the SEMENZA_HIF1_TARGETS gene set
+# This list is based on the MSigDB entry for SEMENZA_HIF1_TARGETS
+semenza_genes <- c(
+"ADM", "ALDOA", "CA9", "ENO1", "ENO2", "GPI", "HK1", "HK2", "LDHA", "PGAM1", "PGK1",
+"PFKP", "SLC2A1", "TPI1", "VEGFA", "PDK1", "BNIP3", "GAPDH", "HMOX1", "IGFBP3",
+"NOS2", "SLC2A3", "SPP1", "TFR2", "TFRC", "TUBB", "TUBB3", "HIF1A"
+)
+# Step 2: Calculate hypoxia score in the Seurat object
+seurat_obj <- AddModuleScore(
+object = seurat_obj,
+features = list(semenza_genes),
+name = "Hypoxia_Semenza"
+)
+# Step 3a: Visualize Hypoxia Score on UMAP
+FeaturePlot(seurat_obj, features = "Hypoxia_Semenza1", cols = c("lightgrey", "blue")) +
+ggtitle("Hypoxia Score (Semenza HIF1 Targets) on UMAP")
+# Step 3b: Violin plot of Hypoxia Score across clusters
+VlnPlot(seurat_obj, features = "Hypoxia_Semenza1", group.by = "seurat_clusters") +
+ggtitle("Hypoxia Score (Semenza HIF1 Targets) by Cluster")
+# Extract hypoxia scores from Seurat object metadata
+scores_df <- seurat_obj@meta.data[, c("Hypoxia_Buffa1", "Hypoxia_Krieg1", "Hypoxia_Semenza1")]
+seurat_obj@meta.data[, c("Buffa_Hypoxia1", "Krieg_Hypoxia1", "Semenza_Hypoxia1")]
+colnames(seurat_obj@meta.data)
+library(GGally)
+install.packages("GGally")
+library(GGally)
+avg_by_sample <- aggregate(
+seurat_obj@meta.data[, c("Hypoxia_Buffa1", "Hypoxia_KDM3A1", "Hypoxia_Semenza1")],
+by = list(Sample = seurat_obj$orig.ident),
+FUN = mean
+)
+avg_sample_long <- melt(avg_by_sample, id.vars = "Sample", variable.name = "GeneSet", value.name = "AvgScore")
+library(tidyr)
+avg_sample_long <- avg_by_sample %>%
+pivot_longer(cols = -Sample, names_to = "GeneSet", values_to = "AvgScore")
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+# Compute average hypoxia scores per sample
+avg_by_sample <- seurat_obj@meta.data %>%
+group_by(Sample = orig.ident) %>%
+summarise(
+Buffa = mean(Hypoxia_Buffa1, na.rm = TRUE),
+Krieg = mean(Hypoxia_KDM3A1, na.rm = TRUE),
+Semenza = mean(Hypoxia_Semenza1, na.rm = TRUE)
+)
+# Pivot longer for plotting
+avg_sample_long <- avg_by_sample %>%
+pivot_longer(cols = c(Buffa, Krieg, Semenza), names_to = "GeneSet", values_to = "AvgScore")
+# Plot
+ggplot(avg_sample_long, aes(x = Sample, y = AvgScore, fill = GeneSet)) +
+geom_col(position = "dodge") +
+theme_minimal() +
+labs(title = "Average Hypoxia Score per Sample", y = "Average Score", x = "Sample") +
+scale_fill_brewer(palette = "Set3")
+avg_by_cluster <- seurat_obj@meta.data %>%
+group_by(Cluster = as.character(seurat_clusters)) %>%
+summarise(
+Buffa = mean(Hypoxia_Buffa1, na.rm = TRUE),
+Krieg = mean(Hypoxia_KDM3A1, na.rm = TRUE),
+Semenza = mean(Hypoxia_Semenza1, na.rm = TRUE)
+)
+avg_cluster_long <- avg_by_cluster %>%
+pivot_longer(cols = c(Buffa, Krieg, Semenza), names_to = "GeneSet", values_to = "AvgScore")
+ggplot(avg_cluster_long, aes(x = Cluster, y = AvgScore, fill = GeneSet)) +
+geom_col(position = "dodge") +
+theme_minimal() +
+labs(title = "Average Hypoxia Score per Cluster", y = "Average Score", x = "Cluster") +
+scale_fill_brewer(palette = "Pastel2")
+install.packages("viridis")  # If not installed
+library(viridis)
+ggplot(avg_sample_long, aes(x = Sample, y = AvgScore, fill = GeneSet)) +
+geom_col(position = "dodge") +
+theme_minimal(base_size = 14) +
+scale_fill_viridis(discrete = TRUE, option = "D") +  # High-contrast, colorblind-friendly
+labs(
+title = "Average Hypoxia Score per Sample",
+y = "Average Score", x = "Sample"
+) +
+theme(legend.position = "right")
+ggplot(avg_cluster_long, aes(x = Cluster, y = AvgScore, fill = GeneSet)) +
+geom_col(position = "dodge") +
+theme_minimal(base_size = 14) +
+scale_fill_viridis(discrete = TRUE, option = "D") +
+labs(
+title = "Average Hypoxia Score per Cluster",
+y = "Average Score", x = "Cluster"
+) +
+theme(legend.position = "right")``
+`{r hypoxia-module-scores, message=FALSE, warning=FALSE, fig.width=12, fig.align='center'}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(viridis)
+
+# Define hypoxia gene sets
+buffa_genes <- c("SLC2A1", "VEGFA", "LDHA", "ENO1", "PGK1", "P4HA1", "ADM", "NDRG1", "BNIP3", "PDK1")
+krieg_genes <- c("ADM", "GDF15", "VEGFA", "BNIP3", "P4HA1", "NDRG1", "SLC2A1", "CA9", "ENO1", "LDHA")
+semenza_genes <- c(
+  "ADM", "ALDOA", "CA9", "ENO1", "ENO2", "GPI", "HK1", "HK2", "LDHA", "PGAM1", "PGK1", "PFKP",
+  "SLC2A1", "TPI1", "VEGFA", "PDK1", "BNIP3", "GAPDH", "HMOX1", "IGFBP3", "NOS2", "SLC2A3", 
+  "SPP1", "TFR2", "TFRC", "TUBB", "TUBB3", "HIF1A"
+)
+
+# Add module scores
+seurat_obj <- AddModuleScore(seurat_obj, features = list(buffa_genes), name = "Hypoxia_Buffa")
+seurat_obj <- AddModuleScore(seurat_obj, features = list(krieg_genes), name = "Hypoxia_KDM3A")
+seurat_obj <- AddModuleScore(seurat_obj, features = list(semenza_genes), name = "Hypoxia_Semenza")
+
+# Visualize hypoxia scores on UMAP
+FeaturePlot(seurat_obj, features = "Hypoxia_Buffa1", cols = c("lightgrey", "red")) +
+  ggtitle("Hypoxia Score (Buffa) on UMAP")
+
+FeaturePlot(seurat_obj, features = "Hypoxia_KDM3A1", cols = c("lightgrey", "red")) +
+  ggtitle("Hypoxia Score (KDM3A) on UMAP")
+
+FeaturePlot(seurat_obj, features = "Hypoxia_Semenza1", cols = c("lightgrey", "blue")) +
+  ggtitle("Hypoxia Score (Semenza) on UMAP")
+
+# Violin plots across clusters
+VlnPlot(seurat_obj, features = "Hypoxia_Buffa1", group.by = "seurat_clusters") +
+  ggtitle("Buffa Hypoxia Score by Cluster")
+
+VlnPlot(seurat_obj, features = "Hypoxia_KDM3A1", group.by = "seurat_clusters") +
+  ggtitle("KDM3A Hypoxia Score by Cluster")
+
+VlnPlot(seurat_obj, features = "Hypoxia_Semenza1", group.by = "seurat_clusters") +
+  ggtitle("Semenza Hypoxia Score by Cluster")
+```
+
+```{r hypoxia-score-summary, message=FALSE, warning=FALSE, fig.width=12}
+# Summarize average hypoxia scores per sample
+avg_by_sample <- seurat_obj@meta.data %>%
+  group_by(Sample = orig.ident) %>%
+  summarise(
+    Buffa = mean(Hypoxia_Buffa1, na.rm = TRUE),
+    Krieg = mean(Hypoxia_KDM3A1, na.rm = TRUE),
+    Semenza = mean(Hypoxia_Semenza1, na.rm = TRUE)
+  )
+
+avg_sample_long <- avg_by_sample %>%
+  pivot_longer(cols = c(Buffa, Krieg, Semenza), names_to = "GeneSet", values_to = "AvgScore")
+
+# Plot per sample
+ggplot(avg_sample_long, aes(x = Sample, y = AvgScore, fill = GeneSet)) +
+  geom_col(position = "dodge") +
+  scale_fill_viridis(discrete = TRUE, option = "D") +
+  theme_minimal(base_size = 14) +
+  labs(title = "Average Hypoxia Score per Sample", y = "Average Score", x = "Sample") +
+  theme(legend.position = "right")
+
+# Summarize average scores per cluster
+avg_by_cluster <- seurat_obj@meta.data %>%
+  group_by(Cluster = as.character(seurat_clusters)) %>%
+  summarise(
+    Buffa = mean(Hypoxia_Buffa1, na.rm = TRUE),
+    Krieg = mean(Hypoxia_KDM3A1, na.rm = TRUE),
+    Semenza = mean(Hypoxia_Semenza1, na.rm = TRUE)
+  )
+
+avg_cluster_long <- avg_by_cluster %>%
+  pivot_longer(cols = c(Buffa, Krieg, Semenza), names_to = "GeneSet", values_to = "AvgScore")
+
+# Plot per cluster
+ggplot(avg_cluster_long, aes(x = Cluster, y = AvgScore, fill = GeneSet)) +
+  geom_col(position = "dodge") +
+  scale_fill_viridis(discrete = TRUE, option = "D") +
+  theme_minimal(base_size = 14) +
+  labs(title = "Average Hypoxia Score per Cluster", y = "Average Score", x = "Cluster") +
+  theme(legend.position = "right")
+```
+`
+
+
+```{r}
+```{r hypoxia-module-scores, message=FALSE, warning=FALSE, fig.width=12, fig.align='center'}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(viridis)
+
+# Define hypoxia gene sets
+buffa_genes <- c("SLC2A1", "VEGFA", "LDHA", "ENO1", "PGK1", "P4HA1", "ADM", "NDRG1", "BNIP3", "PDK1")
+krieg_genes <- c("ADM", "GDF15", "VEGFA", "BNIP3", "P4HA1", "NDRG1", "SLC2A1", "CA9", "ENO1", "LDHA")
+semenza_genes <- c(
+  "ADM", "ALDOA", "CA9", "ENO1", "ENO2", "GPI", "HK1", "HK2", "LDHA", "PGAM1", "PGK1", "PFKP",
+  "SLC2A1", "TPI1", "VEGFA", "PDK1", "BNIP3", "GAPDH", "HMOX1", "IGFBP3", "NOS2", "SLC2A3", 
+  "SPP1", "TFR2", "TFRC", "TUBB", "TUBB3", "HIF1A"
+)
+
+# Add module scores
+seurat_obj <- AddModuleScore(seurat_obj, features = list(buffa_genes), name = "Hypoxia_Buffa")
+seurat_obj <- AddModuleScore(seurat_obj, features = list(krieg_genes), name = "Hypoxia_KDM3A")
+seurat_obj <- AddModuleScore(seurat_obj, features = list(semenza_genes), name = "Hypoxia_Semenza")
+
+# Visualize hypoxia scores on UMAP
+FeaturePlot(seurat_obj, features = "Hypoxia_Buffa1", cols = c("lightgrey", "red")) +
+  ggtitle("Hypoxia Score (Buffa) on UMAP")
+
+FeaturePlot(seurat_obj, features = "Hypoxia_KDM3A1", cols = c("lightgrey", "red")) +
+  ggtitle("Hypoxia Score (KDM3A) on UMAP")
+
+FeaturePlot(seurat_obj, features = "Hypoxia_Semenza1", cols = c("lightgrey", "blue")) +
+  ggtitle("Hypoxia Score (Semenza) on UMAP")
+
+# Violin plots across clusters
+VlnPlot(seurat_obj, features = "Hypoxia_Buffa1", group.by = "seurat_clusters") +
+  ggtitle("Buffa Hypoxia Score by Cluster")
+
+VlnPlot(seurat_obj, features = "Hypoxia_KDM3A1", group.by = "seurat_clusters") +
+  ggtitle("KDM3A Hypoxia Score by Cluster")
+
+VlnPlot(seurat_obj, features = "Hypoxia_Semenza1", group.by = "seurat_clusters") +
+  ggtitle("Semenza Hypoxia Score by Cluster")
+```
+
+```{r hypoxia-score-summary, message=FALSE, warning=FALSE, fig.width=12}
+# Summarize average hypoxia scores per sample
+avg_by_sample <- seurat_obj@meta.data %>%
+  group_by(Sample = orig.ident) %>%
+  summarise(
+    Buffa = mean(Hypoxia_Buffa1, na.rm = TRUE),
+    Krieg = mean(Hypoxia_KDM3A1, na.rm = TRUE),
+    Semenza = mean(Hypoxia_Semenza1, na.rm = TRUE)
+  )
+
+avg_sample_long <- avg_by_sample %>%
+  pivot_longer(cols = c(Buffa, Krieg, Semenza), names_to = "GeneSet", values_to = "AvgScore")
+
+# Plot per sample
+ggplot(avg_sample_long, aes(x = Sample, y = AvgScore, fill = GeneSet)) +
+  geom_col(position = "dodge") +
+  scale_fill_viridis(discrete = TRUE, option = "D") +
+  theme_minimal(base_size = 14) +
+  labs(title = "Average Hypoxia Score per Sample", y = "Average Score", x = "Sample") +
+  theme(legend.position = "right")
+
+# Summarize average scores per cluster
+avg_by_cluster <- seurat_obj@meta.data %>%
+  group_by(Cluster = as.character(seurat_clusters)) %>%
+  summarise(
+    Buffa = mean(Hypoxia_Buffa1, na.rm = TRUE),
+    Krieg = mean(Hypoxia_KDM3A1, na.rm = TRUE),
+    Semenza = mean(Hypoxia_Semenza1, na.rm = TRUE)
+  )
+
+avg_cluster_long <- avg_by_cluster %>%
+  pivot_longer(cols = c(Buffa, Krieg, Semenza), names_to = "GeneSet", values_to = "AvgScore")
+
+# Plot per cluster
+ggplot(avg_cluster_long, aes(x = Cluster, y = AvgScore, fill = GeneSet)) +
+  geom_col(position = "dodge") +
+  scale_fill_viridis(discrete = TRUE, option = "D") +
+  theme_minimal(base_size = 14) +
+  labs(title = "Average Hypoxia Score per Cluster", y = "Average Score", x = "Cluster") +
+  theme(legend.position = "right")
+```
+```{r}
+library(ggpubr)
+# Buffa Hypoxia Score
+ggviolin(seurat_obj@meta.data, x = "seurat_clusters", y = "Hypoxia_Buffa1",
+         fill = "seurat_clusters", palette = "npg", add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test", label.y = max(seurat_obj$Hypoxia_Buffa1, na.rm = TRUE) * 1.1) +
+  labs(title = "Buffa Hypoxia Score by Cluster", x = "Cluster", y = "Buffa Score")
+
+# Krieg/KDM3A Hypoxia Score
+ggviolin(seurat_obj@meta.data, x = "seurat_clusters", y = "Hypoxia_KDM3A1",
+         fill = "seurat_clusters", palette = "npg", add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test", label.y = max(seurat_obj$Hypoxia_KDM3A1, na.rm = TRUE) * 1.1) +
+  labs(title = "KDM3A Hypoxia Score by Cluster", x = "Cluster", y = "Krieg Score")
+
+# Semenza Hypoxia Score
+ggviolin(seurat_obj@meta.data, x = "seurat_clusters", y = "Hypoxia_Semenza1",
+         fill = "seurat_clusters", palette = "npg", add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test", label.y = max(seurat_obj$Hypoxia_Semenza1, na.rm = TRUE) * 1.1) +
+  labs(title = "Semenza Hypoxia Score by Cluster", x = "Cluster", y = "Semenza Score")
+```
+
+
+```{r}
+# Make sure you have a Seurat object loaded as seurat_obj
+if (!exists("seurat_obj")) {
+  stop("Seurat object 'seurat_obj' not found. Please load it with readRDS() or check its name.")
+}
+```
+
+
+```{r}
+{r seurat-obj, warning=FALSE}
+obj <- CreateSeuratObject(
+  counts = counts,
+  meta.data = metadata,
+  min.cells = 3,
+  min.features = 100,
+```
+library(ggpubr)
+# Buffa
+p1 <- ggviolin(obj@meta.data, x = "seurat_clusters", y = "Hypoxia_Buffa1",
+               fill = "seurat_clusters", palette = "npg", add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test", 
+                     label.y = max(obj$Hypoxia_Buffa1, na.rm = TRUE) * 1.1) +
+  labs(title = "Buffa Hypoxia Score by Cluster", x = "Cluster", y = "Buffa Score")
+
+# Krieg/KDM3A
+p2 <- ggviolin(obj@meta.data, x = "seurat_clusters", y = "Hypoxia_KDM3A1",
+               fill = "seurat_clusters", palette = "npg", add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test", 
+                     label.y
+
+
+```{r}
+# Proceed with plotting
+library(ggpubr)
+
+ggviolin(seurat_obj@meta.data, x = "seurat_clusters", y = "Hypoxia_Buffa1",
+         fill = "seurat_clusters", palette = "npg", add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test",
+                     label.y = max(seurat_obj$Hypoxia_Buffa1, na.rm = TRUE) * 1.1) +
+  labs(title = "Buffa Hypoxia Score by Cluster", x = "Cluster", y = "Buffa Score")
+```
+```{r}
+library(Seurat)
+library(ggpubr)
+
+# Create Seurat object
+obj <- CreateSeuratObject(
+  counts = counts,
+  meta.data = metadata,
+  min.cells = 3,
+  min.features = 100
+)
+
+# Buffa Hypoxia Score
+p1 <- ggviolin(obj@meta.data, x = "seurat_clusters", y = "Hypoxia_Buffa1",
+               fill = "seurat_clusters", palette = "npg", add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test",
+                     label.y = max(obj$Hypoxia_Buffa1, na.rm = TRUE) * 1.1) +
+  labs(title = "Buffa Hypoxia Score by Cluster", x = "Cluster", y = "Buffa Score")
+
+# Krieg/KDM3A Hypoxia Score
+p2 <- ggviolin(obj@meta.data, x = "seurat_clusters", y = "Hypoxia_KDM3A1",
+               fill = "seurat_clusters", palette = "npg", add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test",
+                     label.y = max(obj$Hypoxia_KDM3A1, na.rm = TRUE) * 1.1) +
+  labs(title = "Krieg/KDM3A Hypoxia Score by Cluster", x = "Cluster", y = "KDM3A Score")
+
+# Semenza Hypoxia Score
+p3 <- ggviolin(obj@meta.data, x = "seurat_clusters", y = "Hypoxia_Semenza1",
+               fill = "seurat_clusters", palette = "npg", add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test",
+                     label.y = max(obj$Hypoxia_Semenza1, na.rm = TRUE) * 1.1) +
+  labs(title = "Semenza Hypoxia Score by Cluster", x = "Cluster", y = "Semenza Score")
+
+# Arrange plots
+ggarrange(p1, p2, p3, ncol = 1, nrow = 3)
+```
+
+
+```{r}
+ls()
+```
+
+
+```{r}
+library(ggpubr)
+
+# Buffa Hypoxia Score Violin Plot with Kruskal-Wallis Test
+ggviolin(obj@meta.data, x = "seurat_clusters", y = "Hypoxia_Buffa1",
+         fill = "seurat_clusters", palette = "npg", add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test",
+                     label.y = max(obj$Hypoxia_Buffa1, na.rm = TRUE) * 1.1) +
+  labs(title = "Buffa Hypoxia Score by Cluster", x = "Cluster", y = "Buffa Score")
+{r hypoxia-buffa-plot, warning=FALSE, message=FALSE, fig.width=8, fig.height=6}
+```
+
+
+```{r}
+`# Load libraries
+library(Seurat)
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+
+# Make sure these genes exist in data
+hypoxia_genes <- c("SLC2A1", "VEGFA", "LDHA", "ENO1", "PGK1", "P4HA1", "ADM", "NDRG1", "BNIP3", "PDK1")
+
+# Optional: Check how many of them are found in the dataset
+hypoxia_genes_found <- hypoxia_genes[hypoxia_genes %in% rownames(obj)]
+print(hypoxia_genes_found)
+
+# Check that at least some genes are found
+if (length(hypoxia_genes_found) == 0) stop("None of the hypoxia genes found in dataset!")
+
+# Calculate module score
+obj <- AddModuleScore(
+  object = obj,
+  features = list(hypoxia_genes_found),
+  name = "Hypoxia_Buffa"
+)
+
+# Check that the score was added
+head(obj@meta.data[, grep("Hypoxia_Buffa", colnames(obj@meta.data))])
+
+# Plot (RMarkdown chunk or script)
+ggviolin(obj@meta.data, x = "seurat_clusters", y = "Hypoxia_Buffa1",
+         fill = "seurat_clusters", palette = "npg", add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test",
+                     label.y = max(obj$Hypoxia_Buffa1, na.rm = TRUE) * 1.1) +
+  labs(title = "Buffa Hypoxia Score by Cluster", x = "Cluster", y = "Buffa Score")
+``
+
+
+{r}
+library(ggpubr)
+
+ggviolin(obj@meta.data, x = "seurat_clusters", y = "Hypoxia_Buffa1",
+         fill = "seurat_clusters", palette = "npg", add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test",
+                     label.y = max(obj$Hypoxia_Buffa1, na.rm = TRUE) * 1.1) +
+  labs(title = "Buffa Hypoxia Score by Cluster", x = "Cluster", y = "Buffa Score")
+```
+
+
+{r}
+```{r hypoxia-buffa-score, message=FALSE, warning=FALSE, fig.width=10}
+# Load necessary libraries
+library(Seurat)
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+# Define Buffa hypoxia gene set
+hypoxia_genes <- c("SLC2A1", "VEGFA", "LDHA", "ENO1", "PGK1",
+                   "P4HA1", "ADM", "NDRG1", "BNIP3", "PDK1")
+
+# Check genes found in the dataset
+genes_found <- hypoxia_genes[hypoxia_genes %in% rownames(obj)]
+if (length(genes_found) == 0) stop("None of the hypoxia genes found in the dataset!")
+
+# Compute hypoxia score
+obj <- AddModuleScore(object = obj, features = list(genes_found), name = "Hypoxia_Buffa")
+
+
+obj <- FindNeighbors(obj, dims = 1:10)
+obj <- FindClusters(obj, resolution = 0.5)
+# Plot violin + boxplot + Kruskal-Wallis test
+# Determine the number of unique clusters
+num_clusters <- length(unique(obj$seurat_clusters))
+library(RColorBrewer)
+custom_palette <- brewer.pal(n = max(3, min(num_clusters, 12)), name = "Set3")
+if (num_clusters > 12) {
+  custom_palette <- colorRampPalette(brewer.pal(12, "Set3"))(num_clusters)
+}
+# Plot using the custom palette
+ggviolin(obj@meta.data, x = "seurat_clusters", y = "Hypoxia_Buffa1",
+         fill = "seurat_clusters", palette = custom_palette, add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test",
+                     label.y = max(obj$Hypoxia_Buffa1, na.rm = TRUE) * 1.1) +
+  labs(title = "Buffa Hypoxia Score by Cluster", x = "Cluster", y = "Buffa Score")
+#this code with wrong palette, I left this
+ggviolin(obj@meta.data, x = "seurat_clusters", y = "Hypoxia_Buffa1",
+         fill = "seurat_clusters", palette = "npg", add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test",
+                     label.y = max(obj$Hypoxia_Buffa1, na.rm = TRUE) * 1.1) +
+  labs(title = "Buffa Hypoxia Score by Cluster", x = "Cluster", y = "Buffa Score")
+```
+
+`````{r}
+install.packages("RColorBrewer")
+library(RColorBrewer)
+# Determine the number of unique clusters
+num_clusters <- length(unique(obj$seurat_clusters))
+
+# Generate a color palette with enough colors
+#  use RColorBrewer's "Set3" palette or generate a custom palette
+library(RColorBrewer)
+custom_palette <- brewer.pal(n = max(3, min(num_clusters, 12)), name = "Set3")
+
+# If you have more than 12 clusters, use colorRampPalette to interpolate more colors
+
+
+# Plot using the custom palette
+ggviolin(obj@meta.data, x = "seurat_clusters", y = "Hypoxia_Buffa1",
+         fill = "seurat_clusters", palette = custom_palette, add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test",
+                     label.y = max(obj$Hypoxia_Buffa1, na.rm = TRUE) * 1.1) +
+  labs(title = "Buffa Hypoxia Score by Cluster", x = "Cluster", y = "Buffa Score")
+```
+
+`````{r}
+Krieg hypoxia gene set
+krieg_genes <- c("ADM", "GDF15", "VEGFA", "BNIP3", "P4HA1", "NDRG1", "SLC2A1", "CA9", "ENO1", "LDHA")
+
+# Semenza hypoxia gene set
+semenza_genes <- c(
+  "ADM", "ALDOA", "CA9", "ENO1", "ENO2", "GPI", "HK1", "HK2", "LDHA", "PGAM1", "PGK1", "PFKP",
+  "SLC2A1", "TPI1", "VEGFA", "PDK1", "BNIP3", "GAPDH", "HMOX1", "IGFBP3", "NOS2", "SLC2A3", 
+  "SPP1", "TFR2", "TFRC", "TUBB", "TUBB3", "HIF1A"
+)
+```
+```
+
+
+`````{r}
+# Load necessary libraries
+library(Seurat)
+library(dplyr)
+
+# Ensure gene names are in the dataset
+krieg_genes_found <- krieg_genes[krieg_genes %in% rownames(obj)]
+semenza_genes_found <- semenza_genes[semenza_genes %in% rownames(obj)]
+
+# Compute module scores
+obj <- AddModuleScore(obj, features = list(krieg_genes_found), name = "Hypoxia_Krieg")
+obj <- AddModuleScore(obj, features = list(semenza_genes_found), name = "Hypoxia_Semenza")
+# Load necessary libraries
+library(ggpubr)
+library(RColorBrewer)
+
+# Determine the number of clusters
+num_clusters <- length(unique(obj$seurat_clusters))
+
+# Generate a color palette with enough colors
+if (num_clusters <= 12) {
+  custom_palette <- brewer.pal(n = num_clusters, name = "Set3")
+} else {
+  custom_palette <- colorRampPalette(brewer.pal(12, "Set3"))(num_clusters)
+}
+```
+```
+
+
+`````{r}
+# Plot Krieg hypoxia score
+ggviolin(obj@meta.data, x = "seurat_clusters", y = "Hypoxia_Krieg1",
+         fill = "seurat_clusters", palette = custom_palette, add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test",
+                     label.y = max(obj$Hypoxia_Krieg1, na.rm = TRUE) * 1.1) +
+  labs(title = "Krieg Hypoxia Score by Cluster", x = "Cluster", y = "Krieg Score")
+```
+
+
+`````{r}
+# Plot Semenza hypoxia score
+ggviolin(obj@meta.data, x = "seurat_clusters", y = "Hypoxia_Semenza1",
+         fill = "seurat_clusters", palette = custom_palette, add = "boxplot", trim = TRUE) +
+  stat_compare_means(method = "kruskal.test",
+                     label.y = max(obj$Hypoxia_Semenza1, na.rm = TRUE) * 1.1) +
+  labs(title = "Semenza Hypoxia Score by Cluster", x = "Cluster", y = "Semenza Score")
