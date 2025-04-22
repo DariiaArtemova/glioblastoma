@@ -1,0 +1,706 @@
+---
+title: "Initial Processing"
+output: 
+  html_document:
+    df_print: "paged"
+date: "2025-04-02"
+---
+
+```{r libraries, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(Seurat)
+library(dplyr)
+```
+
+## TODO:
+
+-   properly validate this nonsense
+-   better QC
+-   annotate cell types
+-   find doublets
+-   PaCMAP
+
+## Loading Data
+
+```{r load-counts}
+counts <- read.delim(
+  file = "GBM_raw_gene_counts.csv", 
+  sep = " ", 
+  row.names = 1, 
+  check.names = F,
+  ) 
+head(counts)[c(1:15, ncol(counts)-5:ncol(counts))]
+```
+
+We loaded `r ncol(counts)` cells and `r nrow(counts)` genes.
+
+```{r load-metadata}
+metadata <- read.delim(
+  file = "GBM_metadata.csv", 
+  sep = " ", 
+  row.names = 1, 
+  stringsAsFactors = TRUE,
+)
+head(metadata)
+```
+
+```{r tidy-metadata}
+metadata <- metadata |>
+  select(!c(Sample.type, housekeeping_cluster, ends_with("color"))) |>
+  rename(Patient = Sample.name, Paper_cluster = Cluster_2d) |>
+  unite("Batch", Patient, Location, remove = FALSE) |>
+  relocate(Batch, Patient, Location, Selection) |>
+  mutate(Batch = as_factor(Batch))
+head(metadata, n = 3)
+```
+
+```{r}
+table(metadata[c("Patient", "Location")])
+```
+
+```{r patient-data}
+patient_data <- read_excel(
+  "patient_data.xlsx",
+  range = "A2:V6",
+  .name_repair = "unique_quiet"
+  ) |> 
+  rename(Patient = 1) |>
+  rename_with(~ gsub(" ", "_", .x, fixed = TRUE)) |>
+  rename_with(~ paste("Subtype", .x, sep = "_"), Classical:Proneural) |>
+  rename_with(~ paste(.x, "expressing_cell_fraction", sep = "_"), CD274:B2M)
+patient_data
+```
+
+Where WT = Wildtype, M = Methylated, NM = Non methylated, NT = Not tested.
+
+```{r seurat-obj, warning=FALSE}
+obj <- CreateSeuratObject(
+  counts = counts,
+  meta.data = metadata,
+  min.cells = 3,
+  min.features = 100,
+  )
+```
+
+We're left with `r length(Cells(obj))` cells and `r length(Features(obj))` genes.
+
+## QC
+
+```{r feature-counts-vis, warning=FALSE, fig.align='center'}
+VlnPlot(
+  obj,
+  features = c("nFeature_RNA", "nCount_RNA", "ERCC_reads"),
+  layer = "counts",
+) &
+  labs(x = NULL) &
+  scale_x_discrete(labels = NULL, breaks = NULL)
+```
+
+```{r spike-in-vis, warning=FALSE, fig.width=3, fig.align='center'}
+VlnPlot(
+  obj,
+  features = "ERCC_to_non_ERCC",
+  layer = "counts",
+  y.max = 3,
+) +
+  labs(x = NULL) +
+  scale_x_discrete(labels = NULL, breaks = NULL) +
+  guides(fill="none")
+```
+
+```{r qc-feature-scatter, fig.align='center'}
+n_feature_cutoff = 200
+n_count_cutoff = 50000
+
+FeatureScatter(
+  obj,
+  feature1 = "nCount_RNA", 
+  feature2 = "nFeature_RNA",
+  cols = "black"
+) +
+  NoLegend() +
+  geom_hline(
+    aes(yintercept = n_feature_cutoff), 
+    color = "red", linetype = "dashed", 
+  ) +
+  geom_vline(
+    aes(xintercept = n_count_cutoff), 
+    color = "red", linetype = "dashed",
+  )
+```
+
+```{r, include=FALSE}
+n_cells_pre <- length(Cells(obj))
+```
+
+```{r qc-subsetting}
+obj <- subset(obj, subset = nFeature_RNA > n_feature_cutoff & nCount_RNA > n_count_cutoff)
+```
+
+`r n_cells_pre - length(Cells(obj))` cells filtered out during QC.
+
+## Transformation / DimRed (No Integration Version)
+
+```{r no-intgr-pca}
+obj <- SCTransform(object = obj, verbose = FALSE) |> 
+  RunPCA(verbose = FALSE)
+ElbowPlot(object = obj, ndims = 50)
+```
+
+```{r no-intgr-umap, warning=FALSE, fig.width=15, fig.align='center'}
+obj <- RunUMAP(object = obj, dims = 1:30, verbose = FALSE)
+
+DimPlot(
+  object = obj, 
+  reduction = "umap",
+  group.by = "Batch",
+  cols = DiscretePalette(n = nlevels(obj$Batch), palette = "polychrome"),
+  pt.size = 0.1,
+) + 
+  DimPlot(
+    object = obj, 
+    reduction = "umap",
+    group.by = "Selection",
+    pt.size = 0.1,
+  )
+```
+
+## Transformation / DimRed (With Integration This Time)
+
+```{r integration, message=FALSE, warning=FALSE, fig.align='center'}
+obj[["RNA"]] <- split(obj[["RNA"]], f = obj$Batch)
+obj <- SCTransform(object = obj, verbose = FALSE)
+obj <- RunPCA(object = obj, verbose = FALSE)
+ElbowPlot(object = obj, ndims = 50)
+obj <- IntegrateLayers(
+  object = obj,
+  method = HarmonyIntegration,
+  normalization.method = "SCT",
+  orig.reduction = "pca", new.reduction = "harmony",
+  assay = "SCT",
+  verbose = FALSE
+)
+```
+
+```{r integration-umap, message=FALSE, warning=FALSE, fig.width=15, fig.align='center'}
+obj <- RunUMAP(object = obj, reduction = "harmony", dims = 1:30, reduction.name = "umap_harmony", verbose = F)
+
+DimPlot(
+  object = obj, 
+  reduction = "umap_harmony",
+  group.by = "Batch",
+  cols = DiscretePalette(n = nlevels(obj$Batch), palette = "polychrome"),
+  pt.size = 0.1,
+) + 
+  DimPlot(
+    object = obj, 
+    reduction = "umap_harmony",
+    group.by = "Selection",
+    pt.size = 0.1,
+  )
+```
+
+```{r}
+obj <- SCTransform(object = obj, verbose = FALSE)
+obj <- RunPCA(object = obj, verbose = FALSE)
+obj <- FindNeighbors(obj, dims = 1:30)
+obj <- FindClusters(obj, resolution = 0.6)
+obj <- RunUMAP(object = obj, reduction = "harmony", dims = 1:30, reduction.name = "umap_harmony", verbose = F)
+
+DimPlot(obj, reduction = "umap_harmony", group.by = "Selection", label = TRUE, label.box = TRUE, repel = TRUE) + NoLegend()
+DimPlot(obj, reduction = "umap_harmony", group.by = "Location", label = TRUE, label.box = TRUE, repel = TRUE) + NoLegend()
+DimPlot(obj, reduction = "umap_harmony", label = TRUE, label.box = TRUE, repel = TRUE) + NoLegend()
+```
+
+```{r}
+FeaturePlot(obj, features = "PTPRC", reduction = "umap_harmony", pt.size = 0.1)
+FeaturePlot(obj, features = "OLIG1", reduction = "umap_harmony", pt.size = 0.1)
+```
+
+```{r}
+obj <- PrepSCTFindMarkers(obj)
+markers <- FindMarkers(obj, ident.1 = "0", ident.2 = "2", min.diff.pct = 0.25,test.use = "wilcox")
+```
+
+```{r}
+markers %>% filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05) %>% arrange(desc(avg_log2FC))
+```
+
+```{r warning=FALSE}
+cns_markers <- list(
+  Astrocytes = c("GFAP", "AQP4", "ALDH1L1", "S100B", "SLC1A3"),
+  Astrocytes_Protoplasmic = c("SLC1A2", "ALDH1L1", "GFAP"),
+  Astrocytes_Fibrous = c("GFAP", "VIM", "CD44"),
+  Oligodendrocyte_Precursors = c("PDGFRA", "CSPG4"),
+  Oligodendrocytes_Mature = c("MBP", "MOG", "PLP1"),
+  Neurons_Excitatory = c("SLC17A7", "CAMK2A", "GRIN1"),
+  Neurons_Inhibitory = c("GAD1", "GAD2", "SLC32A1"),
+  Microglia = c("TMEM119", "P2RY12", "HEXB", "SALL1", "GPR34", "OLFML3", "MERTK", "PROS1", "TYRO3", "TGFBR1"))
+
+obj <- AddModuleScore(object = obj,
+  features = cns_markers,
+  name = "CNS_Score"
+)
+
+score_columns <- grep("CNS_Score", colnames(obj@meta.data), value = TRUE)
+obj@meta.data$assigned_celltype <- factor(apply(obj@meta.data[, score_columns], 1, function(x) names(cns_markers)[which.max(x)]))
+```
+
+```{r}
+cluster_markers <- FindAllMarkers(
+    obj, only.pos = TRUE,
+    min.pct = 0.25, logfc.threshold = 0.25,
+    group.by = "seurat_clusters"
+)
+
+celltype_markers <- FindAllMarkers(
+    obj, only.pos = TRUE,
+    min.pct = 0.25, logfc.threshold = 0.25,
+    group.by = "assigned_celltype"
+)
+```
+
+```{r}
+celltype_markers
+```
+
+```{r}
+celltype_markers %>% mutate(pct_diff = pct.1 - pct.2) %>% filter(p_val_adj < 0.05, avg_log2FC > 1, pct_diff > 0.3) %>% filter(cluster == "Oligodendrocyte_Precursors")
+```
+
+```{r}
+celltype_markers %>% mutate(pct_diff = pct.1 - pct.2) %>% filter(p_val_adj < 0.05, avg_log2FC > 1, pct_diff > 0.3) %>% filter(cluster == "Oligodendrocytes_Mature")
+```
+
+```{r}
+celltype_markers %>% mutate(pct_diff = pct.1 - pct.2) %>% filter(p_val_adj < 0.05, avg_log2FC > 1, pct_diff > 0.3) %>% filter(cluster == "Microglia")
+```
+
+```{r}
+top5_clusters <- cluster_markers %>% group_by(cluster) %>% filter(p_val_adj < 0.05, avg_log2FC > 1) %>% top_n(n = 3, wt = avg_log2FC) 
+top5_celltypes <- celltype_markers %>% group_by(cluster) %>% filter(p_val_adj < 0.05, avg_log2FC > 1)  %>% top_n(n = 5, wt = avg_log2FC)
+
+DoHeatmap(subset(obj, downsample = 30), features = top5_clusters$gene, assay = "RNA", slot = "counts") + NoLegend()
+DoHeatmap(subset(obj, downsample = 30), features = top5_celltypes$gene, group.by = "assigned_celltype", assay = "RNA", slot = "counts") + NoLegend()
+```
+
+```{r}
+obj@meta.data <- obj@meta.data %>% mutate(condition_celltype = paste0(Location, "_", assigned_celltype))
+```
+
+```{r}
+unique(obj@meta.data$condition_celltype)
+```
+
+```{r}
+Idents(obj) <- obj@meta.data$condition_celltype
+```
+
+```{r}
+microglia_obj <- subset(obj, subset = assigned_celltype == "Microglia")
+
+microglia_obj@meta.data$Tumor_Periphery <- ifelse(
+  microglia_obj@meta.data$Location == "Tumor",
+  "Tumor",
+  ifelse(
+    microglia_obj@meta.data$Location == "Periphery",
+    "Periphery",
+    ifelse(
+      microglia_obj@meta.data$Location == "Distant",
+      "Distant",
+      "Other"
+    )
+  )
+)
+```
+
+```{r warning=FALSE}
+microglia_obj <- SCTransform(microglia_obj, verbose = FALSE)
+microglia_obj <- PrepSCTFindMarkers(microglia_obj)
+```
+
+```{r}
+# Compare Tumor vs. Periphery
+Idents(microglia_obj) <- "Tumor_Periphery"
+tumor_vs_periphery_genes <- FindMarkers(microglia_obj, ident.1 = "Tumor", ident.2 = "Periphery", min.pct = 0.25, logfc.threshold = 0.25)
+```
+
+```{r}
+# Then, compare Tumor vs. Distant
+tumor_vs_distant_genes <- FindMarkers(microglia_obj, ident.1 = "Tumor", ident.2 = "Distant", min.pct = 0.25, logfc.threshold = 0.25)
+```
+
+```{r}
+# And, compare Periphery vs. Distant
+periphery_vs_distant_genes <- FindMarkers(microglia_obj, ident.1 = "Periphery", ident.2 = "Distant", min.pct = 0.25, logfc.threshold = 0.25)
+```
+
+```{r}
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+    #install.packages("BiocManager")
+#BiocManager::install("EnhancedVolcano")
+library(EnhancedVolcano)
+
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+    #install.packages("BiocManager")
+#BiocManager::install("clusterProfiler")
+#BiocManager::install("org.Hs.eg.db")
+library(clusterProfiler)
+library(org.Hs.eg.db)
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+  #install.packages("BiocManager")
+#BiocManager::install("msigdbr")
+library(msigdbr)
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+    #install.packages("BiocManager")
+#BiocManager::install("enrichplot")
+library(enrichplot)
+```
+
+```{r}
+# Visualization and Interpretation
+
+# Function to visualize and interpret DE results
+visualize_de_results <- function(de_genes, comparison_name, top_n_heatmap = 20, top_n_features = 3) {
+  print(paste("Results for:", comparison_name))
+
+  # View top differentially expressed genes
+  head(de_genes)
+
+  # Filter for significant and substantial changes
+  significant_genes <- de_genes %>%
+    filter(p_val_adj < 0.05, abs(avg_log2FC) > 0.5) %>%
+    arrange(desc(avg_log2FC))
+
+  print(significant_genes)
+
+  # Volcano Plot
+  volcano_plot <- EnhancedVolcano::EnhancedVolcano(de_genes,
+    lab = rownames(de_genes),
+    x = "avg_log2FC",
+    y = "p_val_adj",
+    pCutoff = 0.05,
+    FCcutoff = 0.5,
+    title = paste("Volcano Plot:", comparison_name),
+    subtitle = "Значущі гени виділено",
+    caption = paste0("Всього змінних = ", nrow(de_genes)),
+    col = c("grey30", "forestgreen", "royalblue", "firebrick2"),
+    colAlpha = 0.8,
+    boxedLabels = TRUE,
+    drawConnectors = TRUE,
+    widthConnectors = 0.5,
+    colConnectors = "grey50",
+    max.overlaps = 20,
+    legendPosition = "topright",
+    legendLabSize = 10,
+    legendIconSize = 4.0,
+    titleLabSize = 14,
+    subtitleLabSize = 12,
+    captionLabSize = 10,
+    xlab = bquote(~Log[2]~ " зміна експресії"),
+    ylab = bquote(~-Log[10]~italic(P)),
+    pointSize = 1.5
+  )
+  print(volcano_plot)
+
+
+  # Feature Plots (Top N genes)
+  if (nrow(significant_genes) > 0) {
+    tryCatch({
+      top_feature_genes <- head(rownames(significant_genes), top_n_features)
+      feature_plot <- FeaturePlot(microglia_obj, features = top_feature_genes, reduction = "umap_harmony", cols = c("lightgrey", "red"), pt.size = 0.5)
+      print(feature_plot)
+    }, error = function(e) {
+      print(paste("Помилка при створенні FeaturePlot:", e$message))
+    })
+  }
+
+# Heatmap Visualization (з групуванням за поточними Idents)
+if (nrow(significant_genes) > 0) {
+  # Вибираємо топ N значущих генів
+  top_genes <- head(rownames(significant_genes), top_n_heatmap)
+
+  # Масштабуємо дані за допомогою ScaleData
+  microglia_obj <- ScaleData(microglia_obj, features = top_genes, verbose = FALSE)
+
+  # Створюємо хітмапу (групування за поточними Idents)
+  heatmap_plot <- DoHeatmap(object = microglia_obj, features = top_genes, assay = "SCT", slot = "scale.data") +
+    ggplot2::ggtitle(paste("Heatmap (Scaled):", comparison_name)) +
+    ggplot2::theme(plot.title = ggplot2::element_text(color = "white", size = 2, hjust = 0, vjust = 0)) 
+  print(heatmap_plot)
+}
+
+
+  gene_list <- rownames(significant_genes)
+  if (length(gene_list) > 0) {
+    entrez_ids <- bitr(gene_list, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+    if (nrow(entrez_ids) > 0) {
+      # GO Enrichment
+      go_results <- enrichGO(gene = entrez_ids$ENTREZID,
+        OrgDb = org.Hs.eg.db,
+        ont = "BP",
+        pAdjustMethod = "BH",
+        pvalueCutoff = 0.01,
+        qvalueCutoff = 0.05
+      )
+
+    
+      
+      if (!is.null(go_results)) {
+  tryCatch({
+    print(enrichplot::dotplot(go_results, showCategory = 10, title = paste("GO Enrichment:", comparison_name)) +
+            ggplot2::theme(axis.text.y = ggplot2::element_text(size = 8, angle = 0, hjust = 1, vjust = 0.5),
+                           plot.title = ggplot2::element_text(hjust = 0.5))) 
+  }, error = function(e) {
+    print(paste("Недостатньо даних для створення dotplot або структура go_results не відповідає очікуваній.", e$message))
+  })
+}
+
+      # Hallmark Gene Sets
+library(msigdbr)
+hallmark_gene_sets <- msigdbr(species = "Homo sapiens", category = "H")
+
+gene_ranks_symbol <- de_genes$avg_log2FC
+names(gene_ranks_symbol) <- rownames(de_genes)
+entrez_map <- bitr(names(gene_ranks_symbol), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+# Створюємо ранжований список з Entrez ID як іменами
+gene_ranks_entrez_named <- gene_ranks_symbol[entrez_map$SYMBOL]
+names(gene_ranks_entrez_named) <- entrez_map$ENTREZID
+
+# Видаляємо записи з NA в іменах (Entrez ID)
+gene_ranks_entrez_filtered <- gene_ranks_entrez_named[!is.na(names(gene_ranks_entrez_named))]
+
+# Сортуємо ранжований список
+gene_ranks_entrez_filtered <- sort(gene_ranks_entrez_filtered, decreasing = TRUE)
+
+hallmark_results <- GSEA(gene_ranks_entrez_filtered,
+                         TERM2GENE = hallmark_gene_sets %>% dplyr::select(gs_name, entrez_gene),
+                         pvalueCutoff = 0.05
+)
+if (!is.null(hallmark_results) && nrow(hallmark_results) > 0) {
+  tryCatch({
+    print(enrichplot::dotplot(hallmark_results, showCategory = 10, title = paste("Hallmark Enrichment:", comparison_name)) +
+            ggplot2::theme(axis.text.y = ggplot2::element_text(size = 8, angle = 0, hjust = 1, vjust = 0.5), 
+                           plot.title = ggplot2::element_text(hjust = 0.5))) 
+  }, error = function(e) {
+    print(paste("Помилка при створенні dotplot (Hallmark):", e$message))
+  })
+} else {
+  print("Немає значущих результатів збагачення Hallmark gene sets для відображення.")
+}
+    }
+  }
+
+}
+```
+
+```{r warning=FALSE}
+# Apply visualization function to each comparison
+visualize_de_results(tumor_vs_periphery_genes, "Tumor vs. Periphery (Microglia)", top_n_heatmap = 15, top_n_features = 4)
+visualize_de_results(tumor_vs_distant_genes, "Tumor vs. Distant (Microglia)", top_n_heatmap = 15, top_n_features = 4)
+visualize_de_results(periphery_vs_distant_genes, "Periphery vs. Distant (Microglia)", top_n_heatmap = 15, top_n_features = 4)
+```
+
+```{r}
+oligo_obj <- subset(obj, subset = assigned_celltype %in% c("Oligodendrocytes_Mature", "Oligodendrocyte_Precursors"))
+```
+
+```{r}
+oligo_obj@meta.data$Tumor_Periphery <- ifelse(
+  oligo_obj@meta.data$Location == "Tumor",
+  "Tumor",
+  ifelse(
+    oligo_obj@meta.data$Location == "Periphery",
+    "Periphery",
+    ifelse(
+      oligo_obj@meta.data$Location == "Distant",
+      "Distant",
+      "Other"
+    )
+  )
+)
+```
+
+```{r warning=FALSE}
+oligo_obj <- SCTransform(oligo_obj, verbose = FALSE)
+oligo_obj <- PrepSCTFindMarkers(oligo_obj)
+oligo_obj <- RunPCA(oligo_obj, dims = 1:30)
+# Add Dimensionality Reduction (UMAP)
+oligo_obj <- RunUMAP(oligo_obj, dims = 1:30)
+```
+
+```{r}
+# Compare Tumor vs. Periphery
+Idents(oligo_obj) <- "Tumor_Periphery"
+tumor_vs_periphery_oligo_genes <- FindMarkers(oligo_obj, ident.1 = "Tumor", ident.2 = "Periphery", min.pct = 0.25, logfc.threshold = 0.25)
+```
+
+```{r}
+# Compare Tumor vs. Distant
+tumor_vs_distant_oligo_genes <- FindMarkers(oligo_obj, ident.1 = "Tumor", ident.2 = "Distant", min.pct = 0.25, logfc.threshold = 0.25)
+```
+
+```{r}
+# Compare Periphery vs. Distant
+periphery_vs_distant_oligo_genes <- FindMarkers(oligo_obj, ident.1 = "Periphery", ident.2 = "Distant", min.pct = 0.25, logfc.threshold = 0.25)
+```
+
+```{r}
+# Visualization and Interpretation (Oligodendrocytes)
+
+# Function to visualize and interpret DE results for oligo_obj
+visualize_de_results_oligo <- function(de_genes, comparison_name, oligo_obj, top_n_heatmap = 20, top_n_features = 3) {
+  print(paste("Results for:", comparison_name))
+
+  # View top differentially expressed genes
+  head(de_genes)
+
+  # Filter for significant and substantial changes
+  significant_genes <- de_genes %>%
+    filter(p_val_adj < 0.05, abs(avg_log2FC) > 0.5) %>%
+    arrange(desc(avg_log2FC))
+
+  print(significant_genes)
+
+  # Check if significant_genes is empty
+  if (nrow(significant_genes) == 0) {
+    print("No significant genes found with current filtering criteria.")
+    return(NULL) # Exit the function if no genes are found
+  }
+
+  # Volcano Plot (Oligodendrocytes)
+  volcano_plot_oligo <- EnhancedVolcano::EnhancedVolcano(de_genes,
+    lab = rownames(de_genes),
+    x = "avg_log2FC",
+    y = "p_val_adj",
+    pCutoff = 0.05,
+    FCcutoff = 0.5,
+    title = paste("Volcano Plot:", comparison_name),
+    subtitle = "Значущі гени виділено",
+    caption = paste0("Всього змінних = ", nrow(de_genes)),
+    col = c("grey30", "forestgreen", "royalblue", "firebrick2"),
+    colAlpha = 0.8,
+    boxedLabels = TRUE,
+    drawConnectors = TRUE,
+    widthConnectors = 0.5,
+    colConnectors = "grey50",
+    max.overlaps = 20,
+    legendPosition = "topright",
+    legendLabSize = 10,
+    legendIconSize = 4.0,
+    titleLabSize = 14,
+    subtitleLabSize = 12,
+    captionLabSize = 10,
+    xlab = bquote(~Log[2]~ " зміна експресії"),
+    ylab = bquote(~-Log[10]~italic(P)),
+    pointSize = 1.5
+  )
+  print(volcano_plot_oligo)
+
+  # Feature Plots (Top N genes)
+  if (nrow(significant_genes) > 0) {
+    tryCatch({
+      reductions <- Reductions(oligo_obj)
+      if ("umap_harmony" %in% reductions) {
+        reduction_to_use <- "umap_harmony"
+      } else if (length(reductions) > 0) {
+        reduction_to_use <- reductions[1]
+      } else {
+        print("No reductions found in oligo_obj.")
+        return(NULL)
+      }
+      top_feature_genes <- head(rownames(significant_genes), top_n_features)
+      feature_plot_oligo <- FeaturePlot(oligo_obj, features = top_feature_genes, reduction = reduction_to_use, cols = c("lightgrey", "red"), pt.size = 0.5)
+      print(feature_plot_oligo)
+    }, error = function(e) {
+      print(paste("Помилка при створенні FeaturePlot:", e$message))
+    })
+  }
+
+
+# Heatmap Visualization (з групуванням за поточними Idents) для oligo_obj
+if (nrow(significant_genes) > 0) {
+  # Вибираємо топ N значущих генів
+  top_genes <- head(rownames(significant_genes), top_n_heatmap)
+
+  # Масштабуємо дані за допомогою ScaleData для oligo_obj
+  oligo_obj <- ScaleData(oligo_obj, features = top_genes, verbose = FALSE)
+
+  # Створюємо хітмапу (групування за поточними Idents) для oligo_obj
+  heatmap_plot <- DoHeatmap(object = oligo_obj, features = top_genes, assay = "SCT", slot = "scale.data") +
+    ggplot2::ggtitle(paste("Heatmap (Scaled):", comparison_name)) +
+    ggplot2::theme(plot.title = ggplot2::element_text(color = "white", size = 2, hjust = 0, vjust = 0)) 
+  print(heatmap_plot)
+}
+
+  gene_list <- rownames(significant_genes)
+  if (length(gene_list) > 0) {
+    entrez_ids <- bitr(gene_list, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+    if (nrow(entrez_ids) > 0) {
+      # GO Enrichment
+      go_results <- enrichGO(gene = entrez_ids$ENTREZID,
+        OrgDb = org.Hs.eg.db,
+        ont = "BP",
+        pAdjustMethod = "BH",
+        pvalueCutoff = 0.01,
+        qvalueCutoff = 0.05
+      )
+
+if (!is.null(go_results)) {
+  tryCatch({
+    print(enrichplot::dotplot(go_results, showCategory = 10, title = paste("GO Enrichment:", comparison_name)) +
+            ggplot2::theme(axis.text.y = ggplot2::element_text(size = 8, angle = 0, hjust = 1, vjust = 0.5), 
+                           plot.title = ggplot2::element_text(hjust = 0.5))) 
+  }, error = function(e) {
+    print(paste("Недостатньо даних для створення dotplot або структура go_results не відповідає очікуваній.", e$message))
+  })
+}
+
+# Hallmark Gene Sets
+library(msigdbr)
+hallmark_gene_sets <- msigdbr(species = "Homo sapiens", category = "H")
+
+gene_ranks_symbol <- de_genes$avg_log2FC
+names(gene_ranks_symbol) <- rownames(de_genes)
+entrez_map <- bitr(names(gene_ranks_symbol), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+# Створюємо ранжований список з Entrez ID як іменами
+gene_ranks_entrez_named <- gene_ranks_symbol[entrez_map$SYMBOL]
+names(gene_ranks_entrez_named) <- entrez_map$ENTREZID
+
+# Видаляємо записи з NA в іменах (Entrez ID)
+gene_ranks_entrez_filtered <- gene_ranks_entrez_named[!is.na(names(gene_ranks_entrez_named))]
+
+# Сортуємо ранжований список
+gene_ranks_entrez_filtered <- sort(gene_ranks_entrez_filtered, decreasing = TRUE)
+
+hallmark_results <- GSEA(gene_ranks_entrez_filtered,
+                         TERM2GENE = hallmark_gene_sets %>% dplyr::select(gs_name, entrez_gene),
+                         pvalueCutoff = 0.05
+)
+if (!is.null(hallmark_results) && nrow(hallmark_results) > 0) {
+  tryCatch({
+    print(enrichplot::dotplot(hallmark_results, showCategory = 10, title = paste("Hallmark Enrichment:", comparison_name)) +
+            ggplot2::theme(axis.text.y = ggplot2::element_text(size = 8, angle = 0, hjust = 1, vjust = 0.5), 
+                           plot.title = ggplot2::element_text(hjust = 0.5))) 
+  }, error = function(e) {
+    print(paste("Помилка при створенні dotplot (Hallmark):", e$message))
+  })
+} else {
+  print("Немає значущих результатів збагачення Hallmark gene sets для відображення.")
+}
+    }
+  }
+}
+```
+
+```{r warning=FALSE}
+# Apply visualization function to each comparison (Oligodendrocytes) with custom top gene numbers
+visualize_de_results_oligo(tumor_vs_periphery_oligo_genes, "Tumor vs. Periphery (Oligodendrocytes)", oligo_obj, top_n_heatmap = 15, top_n_features = 4)
+visualize_de_results_oligo(tumor_vs_distant_oligo_genes, "Tumor vs. Distant (Oligodendrocytes)", oligo_obj, top_n_heatmap = 15, top_n_features = 4)
+visualize_de_results_oligo(periphery_vs_distant_oligo_genes, "Periphery vs. Distant (Oligodendrocytes)", oligo_obj, top_n_heatmap = 15, top_n_features = 4)
+```
